@@ -22,6 +22,7 @@ export interface EnvironmentProviderCapability {
   templateRefKind?: string;
   templateConfigBinding?: PluginEnvironmentTemplateConfigBinding;
   supportsTemplateDelete: boolean;
+  supportsSetupTokenLogin: boolean;
   displayName?: string;
   description?: string;
   source?: "builtin" | "plugin";
@@ -127,6 +128,7 @@ export function getEnvironmentCapabilities(
       interactiveSetupConnectionTypes: [],
       supportsTemplateCapture: false,
       supportsTemplateDelete: false,
+      supportsSetupTokenLogin: false,
       displayName: "Fake",
       source: "builtin",
     },
@@ -144,6 +146,7 @@ export function getEnvironmentCapabilities(
       templateRefKind: capability.templateRefKind,
       templateConfigBinding: capability.templateConfigBinding,
       supportsTemplateDelete: capability.supportsTemplateDelete ?? false,
+      supportsSetupTokenLogin: capability.supportsSetupTokenLogin ?? false,
       displayName: capability.displayName,
       description: capability.description,
       source: capability.source ?? "plugin",

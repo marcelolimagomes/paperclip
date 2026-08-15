@@ -340,7 +340,9 @@ function resolveClaimedApiKeyPath(value: unknown): string {
 function buildPaperclipEnvForWake(ctx: AdapterExecutionContext, wakePayload: WakePayload): Record<string, string> {
   const paperclipApiUrlOverride = resolvePaperclipApiUrlOverride(ctx.config.paperclipApiUrl);
   const paperclipEnv: Record<string, string> = {
-    ...buildPaperclipEnv(ctx.agent),
+    // The gateway may run off-host and can override the API URL, so loopback
+    // failover candidates would not be reachable (or would be someone else's).
+    ...buildPaperclipEnv(ctx.agent, { includeLoopbackCandidates: false }),
     PAPERCLIP_RUN_ID: ctx.runId,
   };
 

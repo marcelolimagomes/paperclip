@@ -4577,3 +4577,203 @@ describe("ACPX engine run lifecycle corrections (F1: settle every failure after 
     }
   });
 });
+
+describe("ACPX engine run lifecycle corrections (F2: close the runtime for every pre-turn failure)", () => {
+  const startedAt = "2026-01-01T00:00:00.000Z";
+  const handle = {
+    backendSessionId: "backend-session",
+    agentSessionId: "agent-session",
+    runtimeSessionName: "runtime-session",
+  };
+
+  it("test_handshake_failure_closes_runtime_and_removes_warm_entry", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const closeSpy = vi.fn(async () => {});
+    let created = 0;
+    const warmHandles = new Map();
+    const execute = createAcpxEngineExecutor({
+      warmHandles,
+      createRuntime: (options) => {
+        created += 1;
+        const opts = options as AcpRuntimeOptions & {
+          onAgentSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
+        };
+        return {
+          ensureSession: async () => {
+            await opts.onAgentSpawn?.({ pid: 4242, startedAt });
+            return handle;
+          },
+          startTurn: () => ({
+            events: (async function* () {})(),
+            result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+            cancel: async () => {},
+          }),
+          close: closeSpy,
+        } as never;
+      },
+    });
+    const config = {
+      agent: "custom",
+      agentCommand: "node ./fake-acp.js",
+      stateDir,
+      mode: "persistent",
+      warmHandleIdleMs: 60_000,
+    };
+
+    const first = await execute({
+      runId: "warm-handshake-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config,
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+      onSpawn: async () => {},
+    } as never);
+    expect(first.exitCode).toBe(0);
+    expect(warmHandles.size).toBe(1);
+    expect(created).toBe(1);
+
+    // The warm-hit reuses runtime #1 and fails while persisting process identity.
+    const second = await execute({
+      runId: "warm-handshake-2",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: { sessionParams: first.sessionParams },
+      config,
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+      onSpawn: async () => {
+        throw new Error("onSpawn boom");
+      },
+    } as never);
+
+    expect(created).toBe(1);
+    expect(second.exitCode).toBe(1);
+    expect(second.resultJson?.phase).toBe("ensure_session");
+    // The reused runtime is closed and the warm entry removed.
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+    expect(warmHandles.size).toBe(0);
+  });
+
+  it("test_missing_session_handle_closes_runtime", async () => {
+    const root = await makeTempRoot();
+    const closeSpy = vi.fn(async () => {});
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () =>
+        ({
+          // A runtime that returns no session handle drives the missing-handle path.
+          ensureSession: async () => undefined,
+          startTurn: () => ({
+            events: (async function* () {})(),
+            result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+            cancel: async () => {},
+          }),
+          close: closeSpy,
+        }) as never,
+    });
+
+    const result = await execute({
+      runId: "missing-handle",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state") },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.resultJson?.phase).toBe("ensure_session");
+    expect(result.errorCode).toBe("acpx_runtime_error");
+    // The constructed runtime is closed so its child process cannot leak.
+    expect(closeSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("test_warm_hit_failure_closes_runtime_and_does_not_rearm_idle_timer", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    let created = 0;
+    const closes: number[] = [];
+    const warmHandles = new Map();
+    const execute = createAcpxEngineExecutor({
+      warmHandles,
+      createRuntime: (options) => {
+        const id = (created += 1);
+        const opts = options as AcpRuntimeOptions & {
+          onAgentSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
+        };
+        return {
+          ensureSession: async () => {
+            await opts.onAgentSpawn?.({ pid: 1000 + id, startedAt });
+            return handle;
+          },
+          startTurn: () => ({
+            events: (async function* () {})(),
+            result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+            cancel: async () => {},
+          }),
+          close: async () => {
+            closes.push(id);
+          },
+        } as never;
+      },
+    });
+    const config = {
+      agent: "custom",
+      agentCommand: "node ./fake-acp.js",
+      stateDir,
+      mode: "persistent",
+      warmHandleIdleMs: 60_000,
+    };
+
+    const first = await execute({
+      runId: "warm-timer-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config,
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+      onSpawn: async () => {},
+    } as never);
+    expect(first.exitCode).toBe(0);
+    expect(warmHandles.size).toBe(1);
+
+    // A warm-hit whose identity-persist step fails reuses runtime #1 (no new create).
+    const second = await execute({
+      runId: "warm-timer-2",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: { sessionParams: first.sessionParams },
+      config,
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+      onSpawn: async () => {
+        throw new Error("onSpawn boom");
+      },
+    } as never);
+    expect(created).toBe(1);
+    expect(second.exitCode).toBe(1);
+    // Runtime #1 is closed and its warm entry removed. The warm-hit already cleared
+    // the idle timer, and the failure does not re-arm it, so the map is empty.
+    expect(closes).toEqual([1]);
+    expect(warmHandles.size).toBe(0);
+
+    // A later heartbeat finds no warm entry and constructs a fresh runtime, proving
+    // the failed warm-hit did not leave a re-armed entry behind.
+    const third = await execute({
+      runId: "warm-timer-3",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: { sessionParams: first.sessionParams },
+      config,
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+      onSpawn: async () => {},
+    } as never);
+    expect(third.exitCode).toBe(0);
+    expect(created).toBe(2);
+  });
+});

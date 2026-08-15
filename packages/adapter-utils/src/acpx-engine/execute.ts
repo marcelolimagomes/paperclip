@@ -3448,6 +3448,22 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             err,
             phase: "ensure_session",
           });
+          // Close the runtime on a pre-turn handshake failure and drop the matching
+          // warm entry, the same as the configuration failure path. A warm-hit
+          // reuse already cleared the idle timer before the handshake ran, so the
+          // failure must close and remove the entry, never re-arm it.
+          if (handle) {
+            await runtime.close({
+              handle,
+              reason: "paperclip handshake cleanup",
+              discardPersistentState: false,
+            }).catch(() => {});
+            const existing = warmHandles.get(prepared.sessionKey);
+            if (warmHandleMatches(existing, runtime, handle) && existing) {
+              clearWarmHandleTimer(existing);
+              warmHandles.delete(prepared.sessionKey);
+            }
+          }
           await discardStagedRuntime({ handles: stagedRuntimes, prepared });
           await cleanupRemoteBridges(prepared);
           return {
@@ -3466,6 +3482,19 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         }
 
         if (!handle) {
+          // ensureSession returned no session handle. Close the runtime the run
+          // constructed so its child process cannot leak. There is no established
+          // handle, so build a minimal one from the prepared identity; the close is
+          // best effort and never blocks the error result.
+          await runtime.close({
+            handle: {
+              sessionKey: prepared.sessionKey,
+              backend: prepared.acpxAgent,
+              runtimeSessionName: prepared.sessionKey,
+            },
+            reason: "paperclip missing-handle cleanup",
+            discardPersistentState: false,
+          }).catch(() => {});
           await discardStagedRuntime({ handles: stagedRuntimes, prepared });
           await cleanupRemoteBridges(prepared);
           return {

@@ -3051,6 +3051,83 @@ describe("ACPX engine remote session-lifecycle re-staging (PR 3: stage once / re
     expect(disposedRunIds).toContain("run-a");
   });
 
+  // F5 leak window 1: a seam that throws AFTER a successful stage() must not leave
+  // the fresh in-sandbox runtime behind. The engine records the staged result in
+  // the stage wrapper and disposes it when the seam throws.
+  it("test_seam_throw_after_stage_disposes_fresh_staged_runtime", async () => {
+    const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
+    const stagedRuntimes = new Map();
+    let capturedRuntimeRoot: string | null = null;
+    const execute = createAcpxEngineExecutor({
+      warmHandles: new Map(),
+      stagedRuntimes,
+      createRuntime: () => recordingRuntime({ ensureInputs: [] }) as never,
+      prepareRemoteManagedHome: async (input) => {
+        const staged = await input.stage([]);
+        capturedRuntimeRoot = staged.runtimeRootDir;
+        // The seam fails AFTER a successful stage (e.g. an in-sandbox config
+        // materialize step throws). The fresh in-sandbox runtime is already shipped.
+        throw new Error("seam failed after stage");
+      },
+    });
+    const base = baseExecuteArgs({ stateDir, localCwd, executionTarget });
+
+    await expect(
+      execute({ runId: "run-a", runtime: {}, ...base } as never),
+    ).rejects.toThrow("seam failed after stage");
+
+    // The stage shipped a real in-sandbox runtime root (local runner = host FS)...
+    expect(typeof capturedRuntimeRoot).toBe("string");
+    // ...and the seam throw disposed it, so the abandoned managed home is gone.
+    expect(await pathExists(capturedRuntimeRoot!)).toBe(false);
+    // The failed fresh stage was never cached for reuse.
+    expect(stagedRuntimes.size).toBe(0);
+  });
+
+  // F5 leak window 2: when a bridge fails during bring-up on a resume that BORROWED
+  // the cached staged runtime, the rollback must remove the borrowed cache entry
+  // through the same identity guard `discardStagedRuntime` uses — else a later
+  // resume reuses an entry whose host staged-temp was already disposed.
+  it("test_partial_bridge_rollback_removes_borrowed_staged_entry", async () => {
+    const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
+    const ensureInputs: Array<Record<string, unknown>> = [];
+    const stagedRuntimes = new Map();
+    let disposeCalls = 0;
+    const execute = createAcpxEngineExecutor({
+      warmHandles: new Map(),
+      stagedRuntimes,
+      createRuntime: () => recordingRuntime({ ensureInputs }) as never,
+      prepareRemoteManagedHome: async (input) => ({
+        stagedRuntime: await input.stage([]),
+        disposeStaged: async () => {
+          disposeCalls += 1;
+        },
+      }),
+    });
+    const base = baseExecuteArgs({ stateDir, localCwd, executionTarget });
+
+    const first = await execute({ runId: "run-a", runtime: {}, ...base } as never);
+    expect(first.exitCode).toBe(0);
+    // The clean turn cached the staged runtime for reuse; nothing disposed yet.
+    expect(stagedRuntimes.size).toBe(1);
+    expect(disposeCalls).toBe(0);
+
+    // Run B resumes the same session and borrows the cached staged runtime, but a
+    // bridge fails during bring-up.
+    vi.mocked(startAdapterExecutionTargetPaperclipBridge).mockImplementationOnce(async () => {
+      throw new Error("paperclip bridge boom");
+    });
+    await expect(
+      execute({ runId: "run-b", runtime: { sessionParams: first.sessionParams }, ...base } as never),
+    ).rejects.toThrow("paperclip bridge boom");
+
+    // The rollback removed the borrowed cache entry through the identity guard, so a
+    // later resume can never reuse an entry whose host staged-temp was disposed...
+    expect(stagedRuntimes.size).toBe(0);
+    // ...and it fired that entry's shared idempotent dispose exactly once.
+    expect(disposeCalls).toBe(1);
+  });
+
   // Greptile P1 "Concurrent Runs Corrupt Cache Ownership": two overlapping runs
   // of the same session key must not ship into the same remote workspace at once.
   // The per-key staging lock serializes the stage-or-reuse section, so their

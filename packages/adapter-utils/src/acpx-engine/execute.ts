@@ -20,6 +20,7 @@ import {
   prepareAdapterExecutionTargetRuntime,
   readAdapterExecutionTarget,
   resolveAdapterExecutionTargetTimeout,
+  runAdapterExecutionTargetShellCommand,
   startAdapterExecutionTargetPaperclipBridge,
   startAdapterExecutionTargetProcessSessionBridge,
   type AdapterExecutionTarget,
@@ -1360,6 +1361,46 @@ async function stageAcpRemoteRuntime(input: {
   });
 }
 
+// Dispose a freshly staged in-sandbox runtime after a managed-home seam threw. The
+// seam shipped the workspace/home into the sandbox through `stage()` but threw
+// before it could return its `disposeStaged`, so the engine removes the managed
+// runtime root here — otherwise the abandoned in-sandbox managed home (with its
+// staged credentials) leaks in a persistent sandbox. Fail-open: a cleanup miss on
+// an already-failing run is logged and never re-thrown, so it cannot mask the seam
+// error.
+async function disposeFreshStagedRuntime(input: {
+  runId: string;
+  target: AdapterExecutionTarget;
+  stagedRuntime: PreparedAdapterExecutionTargetRuntime;
+  cwd: string;
+  timeoutSec: number;
+  onLog: AdapterExecutionContext["onLog"];
+}): Promise<void> {
+  const runtimeRootDir = input.stagedRuntime.runtimeRootDir;
+  if (!runtimeRootDir) return;
+  try {
+    await runAdapterExecutionTargetShellCommand(
+      input.runId,
+      input.target,
+      `rm -rf ${shellQuote(runtimeRootDir)}`,
+      {
+        cwd: input.cwd,
+        env: {},
+        timeoutSec: Math.max(input.timeoutSec, 15),
+        graceSec: 20,
+        onLog: input.onLog,
+      },
+    );
+  } catch (err) {
+    await input.onLog(
+      "stderr",
+      `[paperclip] Failed to dispose the fresh staged runtime after a managed-home seam error: ${
+        err instanceof Error ? err.message : String(err)
+      }\n`,
+    );
+  }
+}
+
 async function buildRuntime(input: {
   ctx: AdapterExecutionContext;
   engine: AcpxEngineSettings;
@@ -1866,8 +1907,12 @@ async function buildRuntime(input: {
         stagedRuntimes.delete(sessionKey);
         if (stale.dispose) await stale.dispose().catch(() => {});
       }
-      const stage = (assets: AdapterManagedRuntimeAsset[]) =>
-        stageAcpRemoteRuntime({
+      // Record each successful `stage()` result before the seam can fail. A seam
+      // that throws AFTER a successful stage never returns its `disposeStaged`, so
+      // the engine disposes the fresh staged runtime here (see the catch below).
+      let freshlyStagedRuntime: PreparedAdapterExecutionTargetRuntime | null = null;
+      const stage = async (assets: AdapterManagedRuntimeAsset[]) => {
+        const staged = await stageAcpRemoteRuntime({
           runId,
           target: remoteTarget,
           adapterKey: input.engine.adapterType,
@@ -1880,6 +1925,9 @@ async function buildRuntime(input: {
           onRuntimeProgress: input.ctx.onRuntimeProgress,
           runtimeSpan: input.stageRuntimeSpan,
         });
+        freshlyStagedRuntime = staged;
+        return staged;
+      };
       // Snapshot env before the seam so we can capture exactly which keys it
       // repointed onto the in-sandbox home (e.g. `CODEX_HOME`) and replay them
       // verbatim on a later compatible resume. Add/change only — every seam sets
@@ -1900,19 +1948,37 @@ async function buildRuntime(input: {
         dispose: (() => Promise<void>) | null;
       }> => {
         if (input.deps.prepareRemoteManagedHome) {
-          const seeded = await input.deps.prepareRemoteManagedHome({
-            acpxAgent,
-            companyId: agent.companyId,
-            runId,
-            config,
-            executionTarget: remoteTarget,
-            workspaceLocalDir: cwd,
-            timeoutSec,
-            env,
-            onLog: input.ctx.onLog,
-            onRuntimeProgress: input.ctx.onRuntimeProgress,
-            stage,
-          });
+          let seeded: AcpxRemoteManagedHomeResult;
+          try {
+            seeded = await input.deps.prepareRemoteManagedHome({
+              acpxAgent,
+              companyId: agent.companyId,
+              runId,
+              config,
+              executionTarget: remoteTarget,
+              workspaceLocalDir: cwd,
+              timeoutSec,
+              env,
+              onLog: input.ctx.onLog,
+              onRuntimeProgress: input.ctx.onRuntimeProgress,
+              stage,
+            });
+          } catch (seamErr) {
+            // The seam failed after a possible successful stage. Dispose the fresh
+            // staged runtime so the abandoned in-sandbox managed home does not leak,
+            // then rethrow the seam error.
+            if (freshlyStagedRuntime) {
+              await disposeFreshStagedRuntime({
+                runId,
+                target: remoteTarget,
+                stagedRuntime: freshlyStagedRuntime,
+                cwd: sessionCwd,
+                timeoutSec,
+                onLog: input.ctx.onLog,
+              });
+            }
+            throw seamErr;
+          }
           return {
             stagedRuntime: seeded.stagedRuntime,
             teardown: seeded.teardown ?? null,
@@ -2058,8 +2124,21 @@ async function buildRuntime(input: {
     // abandoned, so its staged temp must be released — and release the per-session
     // staging lease so the abandoned run does not strand the next same-session run
     // (cleanupRemoteBridges, which normally releases it, is never reached here).
+    //
+    // Route the dispose through the same ownership-guarded removal
+    // `discardStagedRuntime` uses. When this run BORROWED the cached staged runtime
+    // (a compatible resume), the dispose releases the shared host staged-temp, so
+    // the map entry must go too — otherwise a later resume reuses an entry whose
+    // temp is already gone. The identity guard removes the entry only when the map
+    // still holds this exact staged runtime, so a fresh stage (no cache entry) and
+    // a concurrent run's entry are both left untouched.
     await remoteManagedHomeTeardown?.().catch(() => {});
-    await remoteStagingDispose?.().catch(() => {});
+    await releaseStagedRuntimeEntry({
+      handles: stagedRuntimes,
+      sessionKey,
+      stagedRuntime,
+      dispose: remoteStagingDispose,
+    });
     sessionStagingLeaseRelease?.();
     throw err;
   }
@@ -2802,11 +2881,35 @@ async function discardStagedRuntime(input: {
   prepared: AcpxPreparedRuntime;
 }): Promise<void> {
   const { handles, prepared } = input;
-  const existing = handles.get(prepared.sessionKey);
-  if (existing && prepared.stagedRuntime && existing.stagedRuntime === prepared.stagedRuntime) {
-    handles.delete(prepared.sessionKey);
+  await releaseStagedRuntimeEntry({
+    handles,
+    sessionKey: prepared.sessionKey,
+    stagedRuntime: prepared.stagedRuntime,
+    dispose: prepared.remoteStagingDispose,
+  });
+}
+
+// Ownership-guarded removal + dispose for a staged-runtime cache entry a run owns.
+// Shared by `discardStagedRuntime` (clean-run drop) and the partial-bring-up
+// rollback so both release a borrowed entry the same way:
+//   1. Delete the map entry ONLY when it still holds the exact staged runtime this
+//      run installed or reused (object identity). A concurrent run that replaced
+//      the entry with its own keeps it.
+//   2. Fire this run's own one-time host staged-temp dispose regardless. The
+//      dispose closure is idempotent, so a shared closure re-fired across a reuse
+//      chain is safe.
+async function releaseStagedRuntimeEntry(input: {
+  handles: Map<string, StagedRuntimeCacheEntry>;
+  sessionKey: string;
+  stagedRuntime: PreparedAdapterExecutionTargetRuntime | null;
+  dispose: (() => Promise<void>) | null;
+}): Promise<void> {
+  const { handles, sessionKey, stagedRuntime, dispose } = input;
+  const existing = handles.get(sessionKey);
+  if (existing && stagedRuntime && existing.stagedRuntime === stagedRuntime) {
+    handles.delete(sessionKey);
   }
-  if (prepared.remoteStagingDispose) await prepared.remoteStagingDispose().catch(() => {});
+  if (dispose) await dispose().catch(() => {});
 }
 
 // Per-`sessionKey` async lease: chains each caller after the previous one so

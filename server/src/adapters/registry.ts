@@ -435,10 +435,36 @@ const piLocalAdapter: ServerAdapterModule = {
 // intentional until hermes ships a matching AdapterExecutionContext type.
 const executeHermesLocal = hermesExecute as unknown as ServerAdapterModule["execute"];
 
+function applyHermesRuntimeApiUrl<T extends Parameters<ServerAdapterModule["execute"]>[0]>(ctx: T): T {
+  const runtimeApiUrl = process.env.PAPERCLIP_RUNTIME_API_URL?.trim();
+  if (!runtimeApiUrl) return ctx;
+
+  const existingConfig = (ctx.agent.adapterConfig ?? {}) as Record<string, unknown>;
+  const existingEnv =
+    typeof existingConfig.env === "object" && existingConfig.env !== null && !Array.isArray(existingConfig.env)
+      ? (existingConfig.env as Record<string, string>)
+      : {};
+
+  return {
+    ...ctx,
+    agent: {
+      ...ctx.agent,
+      adapterConfig: {
+        ...existingConfig,
+        paperclipApiUrl: runtimeApiUrl,
+        env: {
+          ...existingEnv,
+          PAPERCLIP_API_URL: runtimeApiUrl,
+        },
+      },
+    },
+  } as T;
+}
+
 const hermesLocalAdapter: ServerAdapterModule = {
   type: "hermes_local",
   execute: async (ctx) => {
-    const normalizedCtx = normalizeHermesConfig(ctx);
+    const normalizedCtx = applyHermesRuntimeApiUrl(normalizeHermesConfig(ctx));
     if (!normalizedCtx.authToken) return executeHermesLocal(normalizedCtx);
 
     const existingConfig = (normalizedCtx.agent.adapterConfig ?? {}) as Record<string, unknown>;

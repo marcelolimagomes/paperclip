@@ -10,6 +10,8 @@ const hermesExecuteMock = vi.hoisted(() =>
   })),
 );
 
+const ORIGINAL_PAPERCLIP_RUNTIME_API_URL = process.env.PAPERCLIP_RUNTIME_API_URL;
+
 vi.mock("hermes-paperclip-adapter/server", () => ({
   execute: hermesExecuteMock,
   testEnvironment: async () => ({
@@ -68,6 +70,8 @@ describe("server adapter registry", () => {
     unregisterServerAdapter("claude_local");
     setOverridePaused("claude_local", false);
     hermesExecuteMock.mockClear();
+    if (ORIGINAL_PAPERCLIP_RUNTIME_API_URL === undefined) delete process.env.PAPERCLIP_RUNTIME_API_URL;
+    else process.env.PAPERCLIP_RUNTIME_API_URL = ORIGINAL_PAPERCLIP_RUNTIME_API_URL;
   });
 
   it("registers external adapters and exposes them through lookup helpers", async () => {
@@ -350,6 +354,39 @@ describe("server adapter registry", () => {
       "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID",
     );
     expect(patchedCtx.agent.adapterConfig.promptTemplate).toContain("Existing prompt");
+  });
+
+  it("injects the explicit runtime API URL into Hermes without changing public server env", async () => {
+    process.env.PAPERCLIP_RUNTIME_API_URL = "http://127.0.0.1:3100";
+
+    const adapter = requireServerAdapter("hermes_local");
+
+    await adapter.execute({
+      runId: "run-123",
+      agent: {
+        id: "agent-123",
+        companyId: "company-123",
+        name: "Hermes Agent",
+        role: "engineer",
+        adapterType: "hermes_local",
+        adapterConfig: {
+          env: {
+            PAPERCLIP_API_URL: "https://paperclip.taskblu.com",
+          },
+        },
+      },
+      runtime: {},
+      config: {},
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+      onSpawn: async () => {},
+      authToken: "agent-run-jwt",
+    });
+
+    const [patchedCtx] = hermesExecuteMock.mock.calls[0];
+    expect(patchedCtx.agent.adapterConfig.paperclipApiUrl).toBe("http://127.0.0.1:3100");
+    expect(patchedCtx.agent.adapterConfig.env.PAPERCLIP_API_URL).toBe("http://127.0.0.1:3100");
   });
 
   it("preserves Hermes command normalization while injecting auth", async () => {

@@ -33,6 +33,8 @@ export function isCodexLocalFastModeSupported(model: string | null | undefined):
 }
 
 export const models = [
+  { id: "gpt-5.6-luna", label: "gpt-5.6-luna" },
+  { id: "gpt-5.6-sol", label: "gpt-5.6-sol" },
   { id: "gpt-5.4", label: "gpt-5.4" },
   { id: DEFAULT_CODEX_LOCAL_MODEL, label: DEFAULT_CODEX_LOCAL_MODEL },
   { id: "gpt-5.3-codex-spark", label: "gpt-5.3-codex-spark" },
@@ -68,6 +70,7 @@ Core fields:
 - instructionsFilePath (string, optional): absolute path to a markdown instructions file prepended to stdin prompt at runtime
 - model (string, optional): Codex model id
 - modelReasoningEffort (string, optional): reasoning effort override (minimal|low|medium|high|xhigh) passed via -c model_reasoning_effort=...
+- modelReasoningEfforts (object, optional): model-to-effort map. When the selected model matches a key, its value takes precedence over modelReasoningEffort; e.g. {"gpt-5.6-luna":"xhigh","gpt-5.6-sol":"high"}
 - promptTemplate (string, optional): run prompt template
 - search (boolean, optional): run codex with --search
 - fastMode (boolean, optional): enable Codex Fast mode; supported on GPT-5.4 and passed through for manual model IDs

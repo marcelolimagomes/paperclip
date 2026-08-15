@@ -37,9 +37,10 @@ export function buildCodexExecArgs(
 ): BuildCodexExecArgsResult {
   const record = asRecord(config);
   const model = asString(record.model, "").trim();
+  const modelReasoningEfforts = asRecord(record.modelReasoningEfforts);
   const modelReasoningEffort = asString(
-    record.modelReasoningEffort,
-    asString(record.reasoningEffort, ""),
+    modelReasoningEfforts[model],
+    asString(record.modelReasoningEffort, asString(record.reasoningEffort, "")),
   ).trim();
   const search = asBoolean(record.search, false);
   const fastModeRequested = asBoolean(record.fastMode, false);

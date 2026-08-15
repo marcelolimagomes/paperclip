@@ -85,4 +85,25 @@ describe("buildCodexExecArgs", () => {
       "-",
     ]);
   });
+
+  it("selects effort from the configured model-to-effort map", () => {
+    const result = buildCodexExecArgs({
+      model: "gpt-5.6-sol",
+      modelReasoningEffort: "xhigh",
+      modelReasoningEfforts: {
+        "gpt-5.6-luna": "xhigh",
+        "gpt-5.6-sol": "high",
+      },
+    });
+
+    expect(result.args).toEqual([
+      "exec",
+      "--json",
+      "--model",
+      "gpt-5.6-sol",
+      "-c",
+      'model_reasoning_effort="high"',
+      "-",
+    ]);
+  });
 });

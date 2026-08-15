@@ -4777,3 +4777,385 @@ describe("ACPX engine run lifecycle corrections (F2: close the runtime for every
     expect(created).toBe(2);
   });
 });
+
+describe("ACPX engine run lifecycle corrections (F3: one teardown error policy)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const okHandle = {
+    backendSessionId: "backend-session",
+    agentSessionId: "agent-session",
+    runtimeSessionName: "runtime-session",
+  };
+
+  async function setupRemoteSandbox() {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const localCwd = path.join(root, "worktree");
+    const remoteCwd = path.join(root, "remote-workspace");
+    await fs.mkdir(localCwd, { recursive: true });
+    await fs.mkdir(remoteCwd, { recursive: true });
+    await fs.writeFile(path.join(localCwd, "hello.txt"), "hi", "utf8");
+    const executionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "fake-plugin",
+      remoteCwd,
+      runner: createLocalSandboxRunner(),
+    };
+    return { root, stateDir, localCwd, remoteCwd, executionTarget };
+  }
+
+  // Stub both sandbox bridges with stop spies collected per start, so a test can
+  // assert the bridges stopped without running the real bridge transport.
+  function stubBridges() {
+    const paperclipStops: Array<ReturnType<typeof vi.fn>> = [];
+    const processStops: Array<ReturnType<typeof vi.fn>> = [];
+    vi.mocked(startAdapterExecutionTargetPaperclipBridge).mockImplementation(async () => {
+      const stop = vi.fn(async () => {});
+      paperclipStops.push(stop);
+      return { env: {}, stop } as never;
+    });
+    vi.mocked(startAdapterExecutionTargetProcessSessionBridge).mockImplementation(async () => {
+      const stop = vi.fn(async () => {});
+      processStops.push(stop);
+      return { agentCommand: null, stop } as never;
+    });
+    const anyStopped = (stops: Array<ReturnType<typeof vi.fn>>) =>
+      stops.some((stop) => stop.mock.calls.length > 0);
+    const stoppedCount = (stops: Array<ReturnType<typeof vi.fn>>) =>
+      stops.filter((stop) => stop.mock.calls.length > 0).length;
+    return { paperclipStops, processStops, anyStopped, stoppedCount };
+  }
+
+  function throwingHandoffContext(): Record<string, unknown> {
+    const context: Record<string, unknown> = {};
+    Object.defineProperty(context, "paperclipSessionHandoffMarkdown", {
+      enumerable: false,
+      get() {
+        throw new Error("prompt build boom");
+      },
+    });
+    return context;
+  }
+
+  function completedTurn() {
+    return {
+      events: (async function* () {})(),
+      result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+      cancel: async () => {},
+    };
+  }
+
+  function throwingTurn() {
+    return {
+      events: (async function* () {
+        throw new Error("turn upstream boom");
+      })(),
+      result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+      cancel: async () => {},
+    };
+  }
+
+  function remoteArgs(
+    stateDir: string,
+    localCwd: string,
+    executionTarget: unknown,
+    overrides: Record<string, unknown> = {},
+  ) {
+    return {
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir, cwd: localCwd },
+      context: {},
+      authToken: "real-run-jwt",
+      executionTarget,
+      onLog: async () => {},
+      onMeta: async () => {},
+      onEvent: async () => {},
+      ...overrides,
+    };
+  }
+
+  it("test_teardown_continues_after_one_teardown_step_fails", async () => {
+    const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
+    const { paperclipStops, processStops, anyStopped } = stubBridges();
+    const stagingLocks = new Map<string, Promise<unknown>>();
+    const logs: Array<{ stream: string; text: string }> = [];
+    const execute = createAcpxEngineExecutor({
+      stagingLocks,
+      warmHandles: new Map(),
+      stagedRuntimes: new Map(),
+      createRuntime: () =>
+        ({
+          ensureSession: async () => okHandle,
+          startTurn: () => throwingTurn(),
+          // A failing teardown step must not stop the later teardown steps.
+          close: async () => {
+            throw new Error("close boom");
+          },
+        }) as never,
+    });
+
+    const result = await execute({
+      runId: "td-continue",
+      ...remoteArgs(stateDir, localCwd, executionTarget, {
+        onLog: async (stream: "stdout" | "stderr", text: string) => {
+          logs.push({ stream, text });
+        },
+      }),
+    } as never);
+
+    expect(result.exitCode).toBe(1);
+    // The close failure did not stop the bridge stops or the lease release.
+    expect(anyStopped(paperclipStops)).toBe(true);
+    expect(anyStopped(processStops)).toBe(true);
+    expect(stagingLocks.size).toBe(0);
+    // The close failure was recorded, not silently dropped.
+    expect(
+      logs.some((entry) => entry.stream === "stderr" && entry.text.includes('teardown step "runtime-close" failed')),
+    ).toBe(true);
+  });
+
+  it("test_staging_lease_releases_in_finally_on_every_exit_path", async () => {
+    const scenarios: Array<{
+      name: string;
+      createRuntime: AcpxEngineExecutorOptions["createRuntime"];
+      context: Record<string, unknown>;
+    }> = [
+      {
+        name: "create_runtime",
+        createRuntime: () => {
+          throw new Error("createRuntime boom");
+        },
+        context: {},
+      },
+      {
+        name: "ensure_session",
+        createRuntime: () =>
+          ({
+            ensureSession: async () => {
+              throw new Error("ensure boom");
+            },
+            startTurn: () => completedTurn(),
+            close: async () => {},
+          }) as never,
+        context: {},
+      },
+      {
+        name: "prepare_turn",
+        createRuntime: () =>
+          ({
+            ensureSession: async () => okHandle,
+            startTurn: () => completedTurn(),
+            close: async () => {},
+          }) as never,
+        context: throwingHandoffContext(),
+      },
+      {
+        name: "turn",
+        createRuntime: () =>
+          ({
+            ensureSession: async () => okHandle,
+            startTurn: () => throwingTurn(),
+            close: async () => {},
+          }) as never,
+        context: {},
+      },
+      {
+        name: "success",
+        createRuntime: () =>
+          ({
+            ensureSession: async () => okHandle,
+            startTurn: () => completedTurn(),
+            close: async () => {},
+          }) as never,
+        context: {},
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
+      stubBridges();
+      const stagingLocks = new Map<string, Promise<unknown>>();
+      const execute = createAcpxEngineExecutor({
+        stagingLocks,
+        warmHandles: new Map(),
+        stagedRuntimes: new Map(),
+        createRuntime: scenario.createRuntime,
+      });
+
+      await execute({
+        runId: `lease-${scenario.name}`,
+        ...remoteArgs(stateDir, localCwd, executionTarget, { context: scenario.context }),
+      } as never).catch(() => {});
+
+      // The staging lease is released in a finally on every exit path, so the lock
+      // map never strands the next same-session run.
+      expect(stagingLocks.size, `lease must release on the ${scenario.name} path`).toBe(0);
+    }
+  });
+
+  it("test_result_emission_failure_does_not_skip_teardown", async () => {
+    const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
+    const { paperclipStops, processStops, anyStopped } = stubBridges();
+    const stagingLocks = new Map<string, Promise<unknown>>();
+    const execute = createAcpxEngineExecutor({
+      stagingLocks,
+      warmHandles: new Map(),
+      stagedRuntimes: new Map(),
+      createRuntime: () =>
+        ({
+          ensureSession: async () => okHandle,
+          startTurn: () => throwingTurn(),
+          close: async () => {},
+        }) as never,
+    });
+
+    await execute({
+      runId: "emit-fail",
+      ...remoteArgs(stateDir, localCwd, executionTarget, {
+        // Fail the acpx.error emission only, so teardown must still run.
+        onLog: async (_stream: "stdout" | "stderr", text: string) => {
+          if (text.includes('"type":"acpx.error"')) throw new Error("onLog boom");
+        },
+      }),
+    } as never).catch(() => {});
+
+    expect(anyStopped(paperclipStops)).toBe(true);
+    expect(anyStopped(processStops)).toBe(true);
+    expect(stagingLocks.size).toBe(0);
+  });
+
+  it("test_result_mapping_throw_after_close_does_not_rerun_teardown", async () => {
+    const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
+    const { paperclipStops, processStops, stoppedCount } = stubBridges();
+    let closeCount = 0;
+    const execute = createAcpxEngineExecutor({
+      warmHandles: new Map(),
+      stagedRuntimes: new Map(),
+      stagingLocks: new Map(),
+      createRuntime: () =>
+        ({
+          ensureSession: async () => okHandle,
+          startTurn: () => ({
+            events: (async function* () {
+              yield { type: "done", stopReason: "end_turn" };
+            })(),
+            // A completed turn whose result mapping throws after the close is read.
+            result: Promise.resolve({
+              status: "completed",
+              get stopReason(): string {
+                throw new Error("mapping boom");
+              },
+            }),
+            cancel: async () => {},
+          }),
+          close: async () => {
+            closeCount += 1;
+          },
+        }) as never,
+    });
+
+    await execute({
+      runId: "map-throw",
+      ...remoteArgs(stateDir, localCwd, executionTarget),
+    } as never).catch(() => {});
+
+    // The completed turn closed the runtime once; the mapping throw did not re-run
+    // the teardown through the turn catch.
+    expect(closeCount).toBe(1);
+    expect(stoppedCount(paperclipStops)).toBe(1);
+    expect(stoppedCount(processStops)).toBe(1);
+  });
+
+  it("test_teardown_failure_does_not_change_external_result", async () => {
+    const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
+    stubBridges();
+    const execute = createAcpxEngineExecutor({
+      warmHandles: new Map(),
+      stagedRuntimes: new Map(),
+      stagingLocks: new Map(),
+      createRuntime: () =>
+        ({
+          ensureSession: async () => okHandle,
+          startTurn: () => throwingTurn(),
+          close: async () => {
+            throw new Error("close boom");
+          },
+        }) as never,
+    });
+
+    const result = await execute({
+      runId: "td-result",
+      ...remoteArgs(stateDir, localCwd, executionTarget),
+    } as never);
+
+    // The exit cause (the turn failure) determines the external result; the failing
+    // teardown step never leaks into it.
+    expect(result.exitCode).toBe(1);
+    expect(result.resultJson?.phase).toBe("turn");
+    expect(result.errorCode).toBe("acpx_turn_failed");
+    expect(result.errorMessage).toContain("turn upstream boom");
+    expect(result.errorMessage).not.toContain("close boom");
+  });
+
+  it("test_flush_child_stderr_runs_on_every_exit_path", async () => {
+    const writes: string[] = [];
+    const spy = vi.spyOn(process.stderr, "write").mockImplementation(((chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    }) as never);
+    try {
+      const scenarios: Array<{ name: string; mode: string; context: Record<string, unknown> }> = [
+        { name: "ensure_session", mode: "ensure_fail", context: {} },
+        { name: "prepare_turn", mode: "success", context: throwingHandoffContext() },
+        { name: "turn", mode: "turn_fail", context: {} },
+        { name: "success", mode: "success", context: {} },
+      ];
+
+      for (const scenario of scenarios) {
+        const root = await makeTempRoot();
+        const marker = `paperclip-flush-probe-${scenario.name}`;
+        const execute = createAcpxEngineExecutor({
+          createRuntime: (options) => {
+            const opts = options as {
+              onAgentStderr?: (chunk: string) => void;
+            };
+            // Emit a partial (newline-free) stderr chunk so it stays pending until a
+            // teardown flush writes it to process.stderr.
+            const emit = () => opts.onAgentStderr?.(marker);
+            return {
+              ensureSession: async () => {
+                emit();
+                if (scenario.mode === "ensure_fail") throw new Error("ensure boom");
+                return okHandle;
+              },
+              startTurn: () =>
+                scenario.mode === "turn_fail" ? throwingTurn() : completedTurn(),
+              close: async () => {},
+            } as never;
+          },
+        });
+
+        await execute({
+          runId: `flush-${scenario.name}`,
+          agent: { id: "agent-1", companyId: "company-1" },
+          runtime: {},
+          config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state") },
+          context: scenario.context,
+          onLog: async () => {},
+          onMeta: async () => {},
+        } as never).catch(() => {});
+
+        expect(
+          writes.some((write) => write.includes(marker)),
+          `flushChildStderr must run on the ${scenario.name} path`,
+        ).toBe(true);
+      }
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});

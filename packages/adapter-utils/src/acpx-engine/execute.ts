@@ -2225,20 +2225,25 @@ async function settleRemoteBridgeStarts(
 }
 
 async function cleanupRemoteBridges(prepared: AcpxPreparedRuntime): Promise<void> {
-  await Promise.allSettled([
-    prepared.processSessionBridge?.stop(),
-    prepared.paperclipBridge?.stop(),
-  ]);
-  // Runs AFTER the bridges stop (mirrors the CLI finally: stop bridge → restore
-  // workspace). Fires the codex auth copy-back via `restoreWorkspace()` and
-  // removes staged temp dirs. The seam logs and swallows its own failures — an
-  // unclean-teardown copy-back miss is the accepted, loud `refresh_token_reused`
-  // residual on the next host Codex use, never silent HOST-credential corruption
-  // — so a teardown fault never masks or fails the run result here.
-  if (prepared.remoteManagedHomeTeardown) {
-    await prepared.remoteManagedHomeTeardown().catch(() => {});
+  try {
+    await Promise.allSettled([
+      prepared.processSessionBridge?.stop(),
+      prepared.paperclipBridge?.stop(),
+    ]);
+    // Runs AFTER the bridges stop (mirrors the CLI finally: stop bridge → restore
+    // workspace). Fires the codex auth copy-back via `restoreWorkspace()` and
+    // removes staged temp dirs. The seam logs and swallows its own failures — an
+    // unclean-teardown copy-back miss is the accepted, loud `refresh_token_reused`
+    // residual on the next host Codex use, never silent HOST-credential corruption
+    // — so a teardown fault never masks or fails the run result here.
+    if (prepared.remoteManagedHomeTeardown) {
+      await prepared.remoteManagedHomeTeardown().catch(() => {});
+    }
+  } finally {
+    // Release the per-session staging lease in a finally, so an earlier teardown
+    // fault never strands it and deadlocks the next run of this session.
+    prepared.sessionStagingLeaseRelease?.();
   }
-  prepared.sessionStagingLeaseRelease?.();
 }
 
 function renderPaperclipEnvNote(env: Record<string, string>): string {
@@ -3253,6 +3258,36 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       let referencedProjectStagingFailuresField:
         | { referencedProjectStagingFailures: Array<{ projectId: string }> }
         | Record<string, never> = {};
+      // One teardown policy for the run. `settleRunResources` stops the bridges,
+      // runs the managed-home copy-back, releases the staging lease (in a finally
+      // inside cleanupRemoteBridges), and flushes the child stderr. It runs at most
+      // once, records each step error, and never throws, so a result-emission
+      // failure or an earlier teardown fault never skips a later step.
+      let runResourcesSettled = false;
+      // `turnTeardownDone` marks that the turn path already closed the runtime and
+      // settled the staged runtime, so a result-mapping throw after the close does
+      // not run the turn teardown a second time.
+      let turnTeardownDone = false;
+      const recordTeardownError = async (step: string, teardownErr: unknown) => {
+        const reason = teardownErr instanceof Error ? teardownErr.message : String(teardownErr);
+        await ctx
+          .onLog("stderr", `[paperclip] ACPX teardown step "${step}" failed: ${reason}\n`)
+          .catch(() => {});
+      };
+      const settleRunResources = async () => {
+        if (runResourcesSettled) return;
+        runResourcesSettled = true;
+        try {
+          await cleanupRemoteBridges(prepared);
+        } catch (teardownErr) {
+          await recordTeardownError("cleanup-remote-bridges", teardownErr);
+        }
+        try {
+          if (childStderrState) flushChildStderr(childStderrState);
+        } catch (teardownErr) {
+          await recordTeardownError("flush-child-stderr", teardownErr);
+        }
+      };
       try {
         // Publish the `sandbox.startup` context to the runtime-parent store for
         // the whole bring-up. A startup-body exec that runs outside a measured
@@ -3442,22 +3477,19 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             });
           }
         } catch (err) {
-          const { classified, message } = await emitAcpxFailure({
-            ctx,
-            prepared,
-            err,
-            phase: "ensure_session",
-          });
           // Close the runtime on a pre-turn handshake failure and drop the matching
           // warm entry, the same as the configuration failure path. A warm-hit
           // reuse already cleared the idle timer before the handshake ran, so the
-          // failure must close and remove the entry, never re-arm it.
+          // failure must close and remove the entry, never re-arm it. The close and
+          // the staged-runtime drop run before the result emission, so a throwing
+          // emission never skips them; `settleRunResources` in the finally stops the
+          // bridges, releases the staging lease, and flushes the child stderr.
           if (handle) {
             await runtime.close({
               handle,
               reason: "paperclip handshake cleanup",
               discardPersistentState: false,
-            }).catch(() => {});
+            }).catch((closeErr) => recordTeardownError("runtime-close", closeErr));
             const existing = warmHandles.get(prepared.sessionKey);
             if (warmHandleMatches(existing, runtime, handle) && existing) {
               clearWarmHandleTimer(existing);
@@ -3465,20 +3497,29 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             }
           }
           await discardStagedRuntime({ handles: stagedRuntimes, prepared });
-          await cleanupRemoteBridges(prepared);
-          return {
-            exitCode: 1,
-            signal: null,
-            timedOut: false,
-            errorMessage: message,
-            ...classified,
-            ...billingFields,
-            ...referencedProjectStagingFailuresField,
-            model: prepared.requestedModel || null,
-            clearSession,
-            resultJson: { phase: "ensure_session" },
-            summary: message,
-          };
+          try {
+            const { classified, message } = await emitAcpxFailure({
+              ctx,
+              prepared,
+              err,
+              phase: "ensure_session",
+            });
+            return {
+              exitCode: 1,
+              signal: null,
+              timedOut: false,
+              errorMessage: message,
+              ...classified,
+              ...billingFields,
+              ...referencedProjectStagingFailuresField,
+              model: prepared.requestedModel || null,
+              clearSession,
+              resultJson: { phase: "ensure_session" },
+              summary: message,
+            };
+          } finally {
+            await settleRunResources();
+          }
         }
 
         if (!handle) {
@@ -3494,21 +3535,24 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             },
             reason: "paperclip missing-handle cleanup",
             discardPersistentState: false,
-          }).catch(() => {});
+          }).catch((closeErr) => recordTeardownError("runtime-close", closeErr));
           await discardStagedRuntime({ handles: stagedRuntimes, prepared });
-          await cleanupRemoteBridges(prepared);
-          return {
-            exitCode: 1,
-            signal: null,
-            timedOut: false,
-            errorMessage: "ACPX did not return a runtime session handle.",
-            errorCode: "acpx_runtime_error",
-            ...billingFields,
-            ...referencedProjectStagingFailuresField,
-            model: prepared.requestedModel || null,
-            resultJson: { phase: "ensure_session" },
-            summary: "ACPX did not return a runtime session handle.",
-          };
+          try {
+            return {
+              exitCode: 1,
+              signal: null,
+              timedOut: false,
+              errorMessage: "ACPX did not return a runtime session handle.",
+              errorCode: "acpx_runtime_error",
+              ...billingFields,
+              ...referencedProjectStagingFailuresField,
+              model: prepared.requestedModel || null,
+              resultJson: { phase: "ensure_session" },
+              summary: "ACPX did not return a runtime session handle.",
+            };
+          } finally {
+            await settleRunResources();
+          }
         }
         sessionHandle = handle;
         startupFailed = false;
@@ -3520,29 +3564,34 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           throw err;
         }
         // The post-build runtime-creation window failed after buildRuntime returned
-        // live bridges and a held staging lease. Settle them the same way the
-        // handshake failure does and return an error result.
-        const { classified, message } = await emitAcpxFailure({
-          ctx,
-          prepared,
-          err,
-          phase: "create_runtime",
-        });
+        // live bridges and a held staging lease. Drop the staged runtime, then emit
+        // and settle: `settleRunResources` in the finally stops the bridges,
+        // releases the staging lease, and flushes the child stderr even if the
+        // emission throws.
         await discardStagedRuntime({ handles: stagedRuntimes, prepared });
-        await cleanupRemoteBridges(prepared);
-        return {
-          exitCode: 1,
-          signal: null,
-          timedOut: false,
-          errorMessage: message,
-          ...classified,
-          ...billingFields,
-          ...referencedProjectStagingFailuresField,
-          model: prepared.requestedModel || null,
-          clearSession,
-          resultJson: { phase: "create_runtime" },
-          summary: message,
-        };
+        try {
+          const { classified, message } = await emitAcpxFailure({
+            ctx,
+            prepared,
+            err,
+            phase: "create_runtime",
+          });
+          return {
+            exitCode: 1,
+            signal: null,
+            timedOut: false,
+            errorMessage: message,
+            ...classified,
+            ...billingFields,
+            ...referencedProjectStagingFailuresField,
+            model: prepared.requestedModel || null,
+            clearSession,
+            resultJson: { phase: "create_runtime" },
+            summary: message,
+          };
+        } finally {
+          await settleRunResources();
+        }
       } finally {
         // End the sandbox.startup span exactly once, on every return and on every
         // throw. It covers buildRuntime through acp.handshake and no further; the
@@ -3557,43 +3606,50 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           onLog: ctx.onLog,
         });
       } catch (err) {
-        const { classified, message } = await emitAcpxFailure({
-          ctx,
-          prepared,
-          err,
-          phase: "configure_session",
-        });
+        // Close the runtime and drop the matching warm entry and the staged runtime
+        // before the result emission, so a throwing emission never skips them.
+        // `settleRunResources` in the finally stops the bridges, releases the
+        // staging lease, and flushes the child stderr.
         await runtime.close({
           handle: sessionHandle,
           reason: "paperclip config cleanup",
           discardPersistentState: false,
-        }).catch(() => {});
+        }).catch((closeErr) => recordTeardownError("runtime-close", closeErr));
         const existing = warmHandles.get(prepared.sessionKey);
         if (warmHandleMatches(existing, runtime, sessionHandle) && existing) {
           clearWarmHandleTimer(existing);
           warmHandles.delete(prepared.sessionKey);
         }
         await discardStagedRuntime({ handles: stagedRuntimes, prepared });
-        await cleanupRemoteBridges(prepared);
-        return {
-          exitCode: 1,
-          signal: null,
-          timedOut: false,
-          errorMessage: message,
-          ...classified,
-          ...billingFields,
-          ...referencedProjectStagingFailuresField,
-          model: prepared.requestedModel || null,
-          clearSession,
-          resultJson: {
+        try {
+          const { classified, message } = await emitAcpxFailure({
+            ctx,
+            prepared,
+            err,
             phase: "configure_session",
-            agent: prepared.acpxAgent,
-            requestedModel: prepared.requestedModel || null,
-            requestedThinkingEffort: prepared.requestedThinkingEffort || null,
-            fastMode: prepared.fastMode,
-          },
-          summary: message,
-        };
+          });
+          return {
+            exitCode: 1,
+            signal: null,
+            timedOut: false,
+            errorMessage: message,
+            ...classified,
+            ...billingFields,
+            ...referencedProjectStagingFailuresField,
+            model: prepared.requestedModel || null,
+            clearSession,
+            resultJson: {
+              phase: "configure_session",
+              agent: prepared.acpxAgent,
+              requestedModel: prepared.requestedModel || null,
+              requestedThinkingEffort: prepared.requestedThinkingEffort || null,
+              fastMode: prepared.fastMode,
+            },
+            summary: message,
+          };
+        } finally {
+          await settleRunResources();
+        }
       }
       let cancelActiveTurn: ((reason: string) => Promise<void>) | null = null;
       let controller: AbortController | null = null;
@@ -3778,6 +3834,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         } else {
           await discardStagedRuntime({ handles: stagedRuntimes, prepared });
         }
+        // The turn path has closed the runtime and settled the staged runtime. Mark
+        // it done so a result-mapping throw below runs the turn teardown once, not a
+        // second time through the catch.
+        turnTeardownDone = true;
 
         const errorMessage = timedOut
           ? formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)
@@ -3789,6 +3849,11 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           stopReason: terminalStopReason,
           message: errorMessage,
         });
+        // Settle the run resources once: stop the bridges, run the copy-back,
+        // release the staging lease (in a finally inside cleanupRemoteBridges), and
+        // flush the child stderr. Mark them settled first so a result-mapping throw
+        // below does not run the teardown again through the turn catch.
+        runResourcesSettled = true;
         await cleanupRemoteBridges(prepared);
         flushChildStderr(childStderrState);
         // The one clean-completion path clears the run failure flag; every other
@@ -3836,41 +3901,52 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         const cancel = cancelActiveTurn as ((reason: string) => Promise<void>) | null;
         const preEmitMessage =
           messageOverride ?? (err instanceof Error ? err.message : String(err));
-        if (cancel) await cancel(preEmitMessage).catch(() => {});
-        await runtime.close({
-          handle: sessionHandle,
-          reason: timedOut ? "paperclip timeout cleanup" : "paperclip error cleanup",
-          discardPersistentState: timedOut,
-        }).catch(() => {});
-        const existing = warmHandles.get(prepared.sessionKey);
-        if (warmHandleMatches(existing, runtime, sessionHandle) && existing) {
-          clearWarmHandleTimer(existing);
-          warmHandles.delete(prepared.sessionKey);
+        // Skip the cancel, close, and staged-runtime drop when the success path
+        // already ran them: a result-mapping throw after the close reaches this
+        // catch, and the turn teardown must not run twice. The close records its
+        // error and never blocks the later teardown; `settleRunResources` in the
+        // finally stops the bridges, releases the staging lease, and flushes the
+        // child stderr even if the emission throws.
+        if (!turnTeardownDone) {
+          turnTeardownDone = true;
+          if (cancel) await cancel(preEmitMessage).catch(() => {});
+          await runtime.close({
+            handle: sessionHandle,
+            reason: timedOut ? "paperclip timeout cleanup" : "paperclip error cleanup",
+            discardPersistentState: timedOut,
+          }).catch((closeErr) => recordTeardownError("runtime-close", closeErr));
+          const existing = warmHandles.get(prepared.sessionKey);
+          if (warmHandleMatches(existing, runtime, sessionHandle) && existing) {
+            clearWarmHandleTimer(existing);
+            warmHandles.delete(prepared.sessionKey);
+          }
+          await discardStagedRuntime({ handles: stagedRuntimes, prepared });
         }
-        await discardStagedRuntime({ handles: stagedRuntimes, prepared });
-        const { classified, message } = await emitAcpxFailure({
-          ctx,
-          prepared,
-          err,
-          phase,
-          messageOverride,
-        });
-        await cleanupRemoteBridges(prepared);
-        flushChildStderr(childStderrState);
-        return {
-          exitCode: 1,
-          signal: timedOut ? "SIGTERM" : null,
-          timedOut,
-          errorMessage: message,
-          errorCode: timedOut ? "acpx_timeout" : classified.errorCode,
-          errorMeta: classified.errorMeta,
-          ...billingFields,
-          ...referencedProjectStagingFailuresField,
-          model: prepared.requestedModel || null,
-          clearSession: clearSession || timedOut,
-          resultJson: { phase },
-          summary: message,
-        };
+        try {
+          const { classified, message } = await emitAcpxFailure({
+            ctx,
+            prepared,
+            err,
+            phase,
+            messageOverride,
+          });
+          return {
+            exitCode: 1,
+            signal: timedOut ? "SIGTERM" : null,
+            timedOut,
+            errorMessage: message,
+            errorCode: timedOut ? "acpx_timeout" : classified.errorCode,
+            errorMeta: classified.errorMeta,
+            ...billingFields,
+            ...referencedProjectStagingFailuresField,
+            model: prepared.requestedModel || null,
+            clearSession: clearSession || timedOut,
+            resultJson: { phase },
+            summary: message,
+          };
+        } finally {
+          await settleRunResources();
+        }
       } finally {
         // End the agent turn span exactly once, on every return and on a throw.
         // `runFailed` is `false` only on a completed, non-timed-out turn, so the

@@ -2068,7 +2068,29 @@ export function buildInvocationEnvForLogs(
   return redactEnvForLogs(merged);
 }
 
-export function buildPaperclipEnv(agent: { id: string; companyId: string }): Record<string, string> {
+export interface BuildPaperclipEnvOptions {
+  /**
+   * Emit the server's own loopback origin as a failover candidate. Correct for
+   * runs that execute on the same host as the server (the default); must be
+   * disabled for remote/cloud execution targets, where `127.0.0.1` is a
+   * different machine and would leak the API token to whatever listens there.
+   */
+  includeLoopbackCandidates?: boolean;
+}
+
+/**
+ * Builds the Paperclip API env for an agent child process.
+ *
+ * `PAPERCLIP_API_URL` stays the primary endpoint, but the child also receives
+ * the listen host/port and an ordered candidate list so a client can fail over
+ * when the primary URL is fronted by an access proxy (Cloudflare Access
+ * bounces non-browser clients to a login page) or is briefly down while the
+ * server restarts. See `PaperclipApiClient` in @paperclipai/mcp-server.
+ */
+export function buildPaperclipEnv(
+  agent: { id: string; companyId: string },
+  options: BuildPaperclipEnvOptions = {},
+): Record<string, string> {
   const resolveHostForUrl = (rawHost: string): string => {
     const host = rawHost.trim();
     if (!host || host === "0.0.0.0" || host === "::") return "localhost";
@@ -2091,6 +2113,50 @@ export function buildPaperclipEnv(agent: { id: string; companyId: string }): Rec
     process.env.PAPERCLIP_RUNTIME_API_URL ??
     `http://${runtimeHost}:${runtimePort}`;
   vars.PAPERCLIP_API_URL = apiUrl;
+
+  if (options.includeLoopbackCandidates === false) return vars;
+
+  const listenHost = process.env.PAPERCLIP_LISTEN_HOST?.trim();
+  const listenPort = process.env.PAPERCLIP_LISTEN_PORT?.trim();
+  if (listenHost) vars.PAPERCLIP_LISTEN_HOST = listenHost;
+  if (listenPort) vars.PAPERCLIP_LISTEN_PORT = listenPort;
+
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  const pushCandidate = (rawUrl: string | null | undefined) => {
+    const trimmed = rawUrl?.trim();
+    if (!trimmed) return;
+    let origin: string;
+    try {
+      origin = new URL(trimmed).origin;
+    } catch {
+      return;
+    }
+    if (seen.has(origin)) return;
+    seen.add(origin);
+    candidates.push(origin);
+  };
+
+  pushCandidate(apiUrl);
+  const inheritedCandidates = process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON;
+  if (inheritedCandidates) {
+    try {
+      const parsed = JSON.parse(inheritedCandidates) as unknown;
+      if (Array.isArray(parsed)) {
+        for (const entry of parsed) {
+          if (typeof entry === "string") pushCandidate(entry);
+        }
+      }
+    } catch {
+      // Ignore malformed inherited candidate lists.
+    }
+  }
+  pushCandidate(`http://${runtimeHost}:${runtimePort}`);
+  pushCandidate(`http://127.0.0.1:${runtimePort}`);
+
+  if (candidates.length > 0) {
+    vars.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = JSON.stringify(candidates);
+  }
   return vars;
 }
 
@@ -2341,6 +2407,7 @@ export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJ
   for (const key of Object.keys(env)) {
     if (!key.startsWith("PAPERCLIP_")) continue;
     if (key === "PAPERCLIP_RUNTIME_API_URL") continue;
+    if (key === "PAPERCLIP_RUNTIME_API_CANDIDATES_JSON") continue;
     if (key === "PAPERCLIP_LISTEN_HOST") continue;
     if (key === "PAPERCLIP_LISTEN_PORT") continue;
     delete env[key];

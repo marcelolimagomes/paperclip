@@ -4377,3 +4377,203 @@ describe("ACPX engine per-step startup timing (run.startup.step events)", () => 
     expect(emitted.has("bridge.process-session")).toBe(false);
   });
 });
+
+describe("ACPX engine run lifecycle corrections (F1: settle every failure after buildRuntime)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // A remote sandbox setup that stages the host worktree through the real local
+  // runner, so a run reaches the post-build window with live bridges and a held
+  // staging lease.
+  async function setupRemoteSandbox() {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const localCwd = path.join(root, "worktree");
+    const remoteCwd = path.join(root, "remote-workspace");
+    await fs.mkdir(localCwd, { recursive: true });
+    await fs.mkdir(remoteCwd, { recursive: true });
+    await fs.writeFile(path.join(localCwd, "hello.txt"), "hi", "utf8");
+    const executionTarget = {
+      kind: "remote",
+      transport: "sandbox",
+      providerKey: "fake-plugin",
+      remoteCwd,
+      runner: createLocalSandboxRunner(),
+    };
+    return { root, stateDir, localCwd, remoteCwd, executionTarget };
+  }
+
+  it("test_runtime_create_failure_returns_error_result_with_phase_create_runtime", async () => {
+    const root = await makeTempRoot();
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => {
+        throw new Error("createRuntime boom");
+      },
+    });
+    const result = await execute({
+      runId: "run-create-fail",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state") },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    // The post-build runtime-creation window failure returns a settled error
+    // result instead of throwing.
+    expect(result.exitCode).toBe(1);
+    expect(result.resultJson?.phase).toBe("create_runtime");
+    expect(result.summary).toContain("createRuntime boom");
+  });
+
+  it("test_runtime_create_failure_stops_bridges_and_releases_staging_lease", async () => {
+    const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
+    const paperclipStop = vi.fn(async () => {});
+    const processStop = vi.fn(async () => {});
+    vi.mocked(startAdapterExecutionTargetPaperclipBridge).mockImplementationOnce(
+      async () => ({ env: {}, stop: paperclipStop }) as never,
+    );
+    vi.mocked(startAdapterExecutionTargetProcessSessionBridge).mockImplementationOnce(
+      async () => ({ agentCommand: null, stop: processStop }) as never,
+    );
+    const stagingLocks = new Map<string, Promise<unknown>>();
+    const execute = createAcpxEngineExecutor({
+      stagingLocks,
+      warmHandles: new Map(),
+      stagedRuntimes: new Map(),
+      createRuntime: () => {
+        throw new Error("createRuntime boom");
+      },
+    });
+
+    const result = await execute({
+      runId: "run-create-fail-remote",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir, cwd: localCwd },
+      context: {},
+      authToken: "real-run-jwt",
+      executionTarget,
+      onLog: async () => {},
+      onMeta: async () => {},
+      onEvent: async () => {},
+    } as never);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.resultJson?.phase).toBe("create_runtime");
+    // Both live bridges stop exactly once.
+    expect(paperclipStop).toHaveBeenCalledTimes(1);
+    expect(processStop).toHaveBeenCalledTimes(1);
+    // The per-session staging lease released, so the lock map does not strand the
+    // next same-session run.
+    expect(stagingLocks.size).toBe(0);
+  });
+
+  it("test_prompt_build_failure_returns_error_result_with_phase_prepare_turn", async () => {
+    const root = await makeTempRoot();
+    const close = vi.fn(async () => {});
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () =>
+        ({
+          ensureSession: async () => ({
+            backendSessionId: "backend-session",
+            agentSessionId: "agent-session",
+            runtimeSessionName: "runtime-session",
+          }),
+          startTurn: () => ({
+            events: (async function* () {})(),
+            result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+            cancel: async () => {},
+          }),
+          close,
+        }) as never,
+    });
+
+    // A throwing accessor on a field only `buildPrompt` reads makes the prompt
+    // build fail after the session handshake succeeds.
+    const context: Record<string, unknown> = {};
+    Object.defineProperty(context, "paperclipSessionHandoffMarkdown", {
+      enumerable: false,
+      get() {
+        throw new Error("prompt build boom");
+      },
+    });
+
+    const result = await execute({
+      runId: "run-prepare-fail",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state") },
+      context,
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.exitCode).toBe(1);
+    expect(result.resultJson?.phase).toBe("prepare_turn");
+    // The established runtime is closed on the pre-turn failure, so no session
+    // leaks.
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("test_sandbox_startup_span_ends_exactly_once_on_every_exit_path", async () => {
+    // Each scenario runs a fresh remote bring-up with a recording trace and asserts
+    // the one sandbox.startup span ends exactly once, whatever the exit path.
+    const failingEnsure = () =>
+      ({
+        ensureSession: async () => {
+          throw new Error("ensureSession boom");
+        },
+        startTurn: () => ({
+          events: (async function* () {})(),
+          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+          cancel: async () => {},
+        }),
+        close: async () => {},
+      }) as never;
+    const scenarios: Array<{ name: string; createRuntime: AcpxEngineExecutorOptions["createRuntime"] }> = [
+      { name: "success", createRuntime: () => buildRuntime() as never },
+      {
+        name: "create_runtime failure",
+        createRuntime: () => {
+          throw new Error("createRuntime boom");
+        },
+      },
+      { name: "ensure_session failure", createRuntime: () => failingEnsure() },
+    ];
+
+    for (const scenario of scenarios) {
+      const { stateDir, localCwd, executionTarget } = await setupRemoteSandbox();
+      const { traceContext, spans } = createRecordingStartupTrace();
+      const execute = createAcpxEngineExecutor({
+        warmHandles: new Map(),
+        stagedRuntimes: new Map(),
+        stagingLocks: new Map(),
+        createRuntime: scenario.createRuntime,
+      });
+
+      await execute({
+        runId: `run-span-${scenario.name.replace(/\s+/g, "-")}`,
+        agent: { id: "agent-1", companyId: "company-1" },
+        runtime: {},
+        config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir, cwd: localCwd },
+        context: {},
+        authToken: "real-run-jwt",
+        executionTarget,
+        startupTraceContext: traceContext,
+        onLog: async () => {},
+        onMeta: async () => {},
+        onEvent: async () => {},
+      } as never);
+
+      const startupSpans = spans.filter((span) => span.name === "sandbox.startup");
+      expect(startupSpans, `scenario "${scenario.name}" must open one sandbox.startup span`).toHaveLength(1);
+      expect(
+        startupSpans[0]!.endCalls,
+        `scenario "${scenario.name}" must end the sandbox.startup span exactly once`,
+      ).toBe(1);
+    }
+  });
+});

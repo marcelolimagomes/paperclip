@@ -1,0 +1,12 @@
+diff --git a/dist/server/execute.js b/dist/server/execute.js
+index 93cddf8243271f5fb3ab101617f9114257e41328..0afe61822d2d752f90a4e24bd39c776b9dfcf105 100644
+--- a/dist/server/execute.js
++++ b/dist/server/execute.js
+@@ -344,6 +344,7 @@ export async function execute(ctx) {
+         timeoutSec,
+         graceSec,
+         onLog: wrappedOnLog,
++        onSpawn: ctx.onSpawn,
+     });
+     // ── Parse output ───────────────────────────────────────────────────────
+     const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");

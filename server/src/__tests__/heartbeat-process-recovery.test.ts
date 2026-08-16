@@ -73,6 +73,7 @@ vi.mock("../adapters/index.ts", async () => {
 
 import {
   heartbeatService,
+  persistRunningRunProcessMetadata,
   redactDetectedSuccessfulRunProgressSummaryForBoard,
 } from "../services/heartbeat.ts";
 import {
@@ -1782,6 +1783,28 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       timeoutConfigured: false,
       timeoutFired: false,
     });
+  });
+
+  it("rejects process metadata when cancellation wins the spawn race", async () => {
+    const { runId } = await seedRunFixture({
+      agentStatus: "running",
+      includeIssue: false,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const persisted = await persistRunningRunProcessMetadata(db, runId, {
+      pid: 12345,
+      processGroupId: null,
+      startedAt: new Date().toISOString(),
+    });
+
+    expect(persisted).toBeNull();
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.processPid).toBeNull();
+    expect(run?.processGroupId).toBeNull();
   });
 
   it("dispatches assigned todo work with no prior run as a normal assignment wake", async () => {

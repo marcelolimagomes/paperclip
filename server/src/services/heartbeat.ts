@@ -2227,6 +2227,25 @@ function isProcessAlive(pid: number | null | undefined) {
   }
 }
 
+export async function persistRunningRunProcessMetadata(
+  db: Db,
+  runId: string,
+  meta: { pid: number; processGroupId: number | null; startedAt: string },
+) {
+  const startedAt = new Date(meta.startedAt);
+  return db
+    .update(heartbeatRuns)
+    .set({
+      processPid: meta.pid,
+      processGroupId: meta.processGroupId,
+      processStartedAt: Number.isNaN(startedAt.getTime()) ? new Date() : startedAt,
+      updatedAt: new Date(),
+    })
+    .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
+    .returning()
+    .then((rows) => rows[0] ?? null);
+}
+
 async function terminateHeartbeatRunProcess(input: {
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
@@ -4408,24 +4427,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .from(heartbeatRunEvents)
       .where(eq(heartbeatRunEvents.runId, runId));
     return Number(row?.maxSeq ?? 0) + 1;
-  }
-
-  async function persistRunProcessMetadata(
-    runId: string,
-    meta: { pid: number; processGroupId: number | null; startedAt: string },
-  ) {
-    const startedAt = new Date(meta.startedAt);
-    return db
-      .update(heartbeatRuns)
-      .set({
-        processPid: meta.pid,
-        processGroupId: meta.processGroupId,
-        processStartedAt: Number.isNaN(startedAt.getTime()) ? new Date() : startedAt,
-        updatedAt: new Date(),
-      })
-      .where(eq(heartbeatRuns.id, runId))
-      .returning()
-      .then((rows) => rows[0] ?? null);
   }
 
   async function clearDetachedRunWarning(runId: string) {
@@ -7795,7 +7796,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         onLog,
         onMeta: onAdapterMeta,
         onSpawn: async (meta) => {
-          await persistRunProcessMetadata(run.id, {
+          const persisted = await persistRunningRunProcessMetadata(db, run.id, {
             pid: meta.pid,
             processGroupId:
               "processGroupId" in meta && typeof meta.processGroupId === "number"
@@ -7803,6 +7804,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 : null,
             startedAt: meta.startedAt,
           });
+          if (!persisted) {
+            await terminateHeartbeatRunProcess({
+              pid: meta.pid,
+              processGroupId:
+                "processGroupId" in meta && typeof meta.processGroupId === "number"
+                  ? meta.processGroupId
+                  : null,
+            });
+            runningProcesses.delete(run.id);
+          }
         },
         authToken: authToken ?? undefined,
       });

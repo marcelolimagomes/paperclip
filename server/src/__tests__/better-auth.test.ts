@@ -3,6 +3,7 @@ import type { BetterAuthOptions } from "better-auth";
 import { getCookies } from "better-auth/cookies";
 import {
   buildBetterAuthAdvancedOptions,
+  buildKeycloakProvider,
   deriveAuthCookiePrefix,
   deriveAuthTrustedOrigins,
 } from "../auth/better-auth.js";
@@ -74,5 +75,55 @@ describe("Better Auth cookie scoping", () => {
     ]));
     expect(trustedOrigins).not.toContain("https://board.example.test:3100");
     expect(trustedOrigins).not.toContain("http://board.example.test:3100");
+  });
+});
+
+describe("Keycloak OIDC provider (Taskblu fork, ADR-012)", () => {
+  const KEYS = [
+    "PAPERCLIP_OIDC_ISSUER",
+    "PAPERCLIP_OIDC_CLIENT_ID",
+    "PAPERCLIP_OIDC_PROVIDER_ID",
+  ] as const;
+  const ORIGINAL = Object.fromEntries(KEYS.map((key) => [key, process.env[key]]));
+
+  afterEach(() => {
+    for (const key of KEYS) {
+      if (ORIGINAL[key] === undefined) delete process.env[key];
+      else process.env[key] = ORIGINAL[key];
+    }
+  });
+
+  it("stays absent until both variables are set", () => {
+    delete process.env.PAPERCLIP_OIDC_ISSUER;
+    delete process.env.PAPERCLIP_OIDC_CLIENT_ID;
+    expect(buildKeycloakProvider()).toBeNull();
+
+    process.env.PAPERCLIP_OIDC_ISSUER = "https://auth.taskblu.com/realms/taskblu";
+    expect(buildKeycloakProvider()).toBeNull();
+  });
+
+  it("derives discovery from the issuer and trims the trailing slash", () => {
+    process.env.PAPERCLIP_OIDC_ISSUER = "https://auth.taskblu.com/realms/taskblu/";
+    process.env.PAPERCLIP_OIDC_CLIENT_ID = "taskblu-paperclip";
+    expect(buildKeycloakProvider()).toMatchObject({
+      providerId: "keycloak",
+      discoveryUrl:
+        "https://auth.taskblu.com/realms/taskblu/.well-known/openid-configuration",
+      clientId: "taskblu-paperclip",
+      pkce: true,
+    });
+  });
+
+  it("carries no client secret and no basic authentication", () => {
+    // Public client with PKCE. `authentication: "basic"` would send
+    // `Basic base64(clientId + ":")` when no secret exists -- an empty password
+    // rather than no authentication -- and Keycloak rejects it while the
+    // configuration still reads as correct.
+    process.env.PAPERCLIP_OIDC_ISSUER = "https://auth.taskblu.com/realms/taskblu";
+    process.env.PAPERCLIP_OIDC_CLIENT_ID = "taskblu-paperclip";
+    const provider = buildKeycloakProvider();
+    expect(provider).not.toBeNull();
+    expect(provider).not.toHaveProperty("clientSecret");
+    expect(provider).not.toHaveProperty("authentication");
   });
 });

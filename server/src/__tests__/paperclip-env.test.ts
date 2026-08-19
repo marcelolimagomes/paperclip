@@ -7,8 +7,12 @@ const ORIGINAL_PAPERCLIP_LISTEN_HOST = process.env.PAPERCLIP_LISTEN_HOST;
 const ORIGINAL_PAPERCLIP_LISTEN_PORT = process.env.PAPERCLIP_LISTEN_PORT;
 const ORIGINAL_HOST = process.env.HOST;
 const ORIGINAL_PORT = process.env.PORT;
+const ORIGINAL_CANDIDATES_JSON = process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON;
 
 afterEach(() => {
+  if (ORIGINAL_CANDIDATES_JSON === undefined) delete process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON;
+  else process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = ORIGINAL_CANDIDATES_JSON;
+
   if (ORIGINAL_PAPERCLIP_RUNTIME_API_URL === undefined) delete process.env.PAPERCLIP_RUNTIME_API_URL;
   else process.env.PAPERCLIP_RUNTIME_API_URL = ORIGINAL_PAPERCLIP_RUNTIME_API_URL;
 
@@ -72,6 +76,39 @@ describe("buildPaperclipEnv", () => {
     const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" });
 
     expect(env.PAPERCLIP_API_URL).toBe("http://localhost:3101");
+  });
+
+  it("propagates the loopback failover candidates to the child env", () => {
+    delete process.env.PAPERCLIP_RUNTIME_API_URL;
+    delete process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON;
+    process.env.PAPERCLIP_API_URL = "https://paperclip.taskblu.com";
+    process.env.PAPERCLIP_LISTEN_HOST = "127.0.0.1";
+    process.env.PAPERCLIP_LISTEN_PORT = "3100";
+
+    const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" });
+
+    expect(env.PAPERCLIP_LISTEN_HOST).toBe("127.0.0.1");
+    expect(env.PAPERCLIP_LISTEN_PORT).toBe("3100");
+    expect(JSON.parse(env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON)).toEqual([
+      "https://paperclip.taskblu.com",
+      "http://127.0.0.1:3100",
+    ]);
+  });
+
+  it("omits loopback candidates for remote execution targets", () => {
+    delete process.env.PAPERCLIP_RUNTIME_API_URL;
+    process.env.PAPERCLIP_API_URL = "https://paperclip.taskblu.com";
+    process.env.PAPERCLIP_LISTEN_HOST = "127.0.0.1";
+    process.env.PAPERCLIP_LISTEN_PORT = "3100";
+
+    const env = buildPaperclipEnv(
+      { id: "agent-1", companyId: "company-1" },
+      { includeLoopbackCandidates: false },
+    );
+
+    expect(env.PAPERCLIP_API_URL).toBe("https://paperclip.taskblu.com");
+    expect(env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON).toBeUndefined();
+    expect(env.PAPERCLIP_LISTEN_HOST).toBeUndefined();
   });
 
   it("formats IPv6 hosts safely in fallback URL generation", () => {

@@ -105,7 +105,8 @@ function buildWakeEnv(ctx: AdapterExecutionContext, configEnv: Record<string, st
   const { runId, agent, context, authToken } = ctx;
   const env: Record<string, string> = {
     ...configEnv,
-    ...buildPaperclipEnv(agent),
+    // Cloud target: loopback is a different machine, so no loopback failover.
+    ...buildPaperclipEnv(agent, { includeLoopbackCandidates: false }),
     PAPERCLIP_RUN_ID: runId,
   };
   // PAPERCLIP_API_KEY is never accepted from config — the harness-minted run

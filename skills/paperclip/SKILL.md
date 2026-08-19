@@ -19,6 +19,29 @@ In Paperclip, **task** and **issue** refer to the same work item. The UI may use
 
 Env vars auto-injected: `PAPERCLIP_AGENT_ID`, `PAPERCLIP_COMPANY_ID`, `PAPERCLIP_API_URL`, `PAPERCLIP_RUN_ID`. Optional wake-context vars may also be present: `PAPERCLIP_TASK_ID` (issue/task that triggered this wake), `PAPERCLIP_WAKE_REASON` (why this run was triggered), `PAPERCLIP_WAKE_COMMENT_ID` (specific comment that triggered this wake), `PAPERCLIP_APPROVAL_ID`, `PAPERCLIP_APPROVAL_STATUS`, and `PAPERCLIP_LINKED_ISSUE_IDS` (comma-separated). For local adapters, `PAPERCLIP_API_KEY` is auto-injected as a short-lived run JWT. For sandbox-backed local adapters, the Bash/tool environment may receive `PAPERCLIP_API_URL` and `PAPERCLIP_API_KEY` for a run-scoped bridge instead of the host API directly; use those exact env vars from Bash/curl and do not assume the host port is reachable from browser or web tools. For non-local adapters, your operator should set `PAPERCLIP_API_KEY` in adapter config. All requests use `Authorization: Bearer $PAPERCLIP_API_KEY`. All endpoints under `/api`, all JSON. Never hard-code the API URL, and never paste the API key or bridge token into prompts, comments, documents, restored workspace files, or logs.
 
+**If the API is unreachable, fail over before giving up.** `PAPERCLIP_API_URL` may point at a public hostname fronted by an access proxy (Cloudflare Access and friends) that bounces non-browser clients. Symptoms: a `3xx` to `*.cloudflareaccess.com/cdn-cgi/access/login/...`, an HTML login page instead of JSON, or a connection error while the server restarts. The run env also carries the server's own listen address, so pick a reachable endpoint instead of failing the heartbeat:
+
+```bash
+# Ordered candidates: configured URL first, then this host's loopback.
+paperclip_api() {  # usage: paperclip_api GET /issues/<id> [extra curl args]
+  method="$1" path="$2"; shift 2
+  for base in "$PAPERCLIP_API_URL" "http://127.0.0.1:${PAPERCLIP_LISTEN_PORT:-3100}"; do
+    [ -n "$base" ] || continue
+    # No -L: a redirect here is the access gate, not the API.
+    body=$(curl -sS --max-time 20 -w '\n%{http_code}' -X "$method" "$base/api${path}" \
+      -H "Authorization: Bearer $PAPERCLIP_API_KEY" -H 'Accept: application/json' "$@") || continue
+    code=$(printf '%s' "$body" | tail -n1)
+    case "$code" in 3??|000|502|503|504) continue;; esac
+    printf '%s' "$body" | sed '$d'; return 0
+  done
+  return 1
+}
+```
+
+`PAPERCLIP_LISTEN_HOST` / `PAPERCLIP_LISTEN_PORT` are the server's own listen address; `PAPERCLIP_RUNTIME_API_CANDIDATES_JSON`, when present, is the full ordered candidate list as a JSON array.
+
+Treat a `3xx` as a transport failure worth retrying elsewhere — never as an API response. If every candidate fails, wait a few seconds and retry once (the server may be restarting) before marking work blocked.
+
 Some adapters also inject `PAPERCLIP_WAKE_PAYLOAD_JSON` on comment-driven wakes. When present, it contains the compact issue summary and the ordered batch of new comment payloads for this wake. Use it first. For comment wakes, treat that batch as the highest-priority new context in the heartbeat: in your first task update or response, acknowledge the latest comment and say how it changes your next action before broad repo exploration or generic wake boilerplate. Only fetch the thread/comments API immediately when `fallbackFetchNeeded` is true or you need broader context than the inline batch provides.
 
 Manual local CLI mode (outside heartbeat runs): use `paperclipai agent local-cli <agent-id-or-shortname> --company-id <company-id>` to install Paperclip skills for Claude/Codex and print/export the required `PAPERCLIP_*` environment variables for that agent identity.

@@ -109,6 +109,42 @@ export const authApi = {
     await authPost("/sign-in/email", input);
   },
 
+  // Divergência de fork declarada sob ADR-012 (Taskblu Co-Working Assistant).
+  listOidcProviders: async (): Promise<{ id: string; label: string }[]> => {
+    const res = await fetch("/api/auth/oidc-providers", {
+      credentials: "include",
+      headers: { Accept: "application/json" },
+    });
+    if (!res.ok) return [];
+    const payload = await res.json().catch(() => null);
+    const providers = (payload as { providers?: unknown } | null)?.providers;
+    if (!Array.isArray(providers)) return [];
+    return providers.flatMap((entry) => {
+      if (!entry || typeof entry !== "object") return [];
+      const { id, label } = entry as { id?: unknown; label?: unknown };
+      return typeof id === "string" && typeof label === "string" ? [{ id, label }] : [];
+    });
+  },
+
+  // O better-auth responde `{ url, redirect: true }` e guarda o verificador
+  // PKCE num cookie desta MESMA resposta -- por isso o fluxo tem de comecar
+  // aqui, no navegador do usuario. Uma URL de autorizacao gerada em outro
+  // lugar chega ao callback sem o cookie e falha.
+  startOidcSignIn: async (providerId: string, callbackURL = "/") => {
+    const res = await fetch("/api/auth/sign-in/oauth2", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ providerId, callbackURL }),
+    });
+    const payload = await res.json().catch(() => null);
+    const url = (payload as { url?: unknown } | null)?.url;
+    if (!res.ok || typeof url !== "string") {
+      throw new Error(`Could not start ${providerId} sign-in (${res.status})`);
+    }
+    window.location.assign(url);
+  },
+
   signUpEmail: async (input: { name: string; email: string; password: string }) => {
     await authPost("/sign-up/email", input);
   },

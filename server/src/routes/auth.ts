@@ -8,6 +8,7 @@ import {
   updateCurrentUserProfileSchema,
 } from "@paperclipai/shared";
 import { unauthorized } from "../errors.js";
+import { buildKeycloakProvider } from "../auth/better-auth.js";
 import { validate } from "../middleware/validate.js";
 
 async function loadCurrentUserProfile(db: Db, userId: string) {
@@ -36,6 +37,30 @@ async function loadCurrentUserProfile(db: Db, userId: string) {
 
 export function authRoutes(db: Db) {
   const router = Router();
+
+  /**
+   * Divergência de fork declarada sob ADR-012 (Taskblu Co-Working Assistant).
+   *
+   * O provedor OIDC já existia no servidor, mas nada no navegador iniciava o
+   * fluxo: o `POST /api/auth/sign-in/oauth2` do better-auth funciona e a tela
+   * de login não tinha botão para ele, então a única porta que um humano
+   * enxergava era e-mail e senha. Esta rota conta à UI quais provedores estão
+   * ligados, para que o botão apareça quando -- e somente quando -- houver
+   * provedor configurado.
+   *
+   * É PÚBLICA de propósito: quem a lê ainda não tem sessão. Ela devolve apenas
+   * identificador e rótulo, nunca issuer, client_id ou qualquer segredo.
+   */
+  router.get("/oidc-providers", (_req, res) => {
+    const keycloak = buildKeycloakProvider();
+    const providers = keycloak
+      ? [{
+          id: keycloak.providerId,
+          label: process.env.PAPERCLIP_OIDC_DISPLAY_NAME?.trim() || "Taskblu SSO",
+        }]
+      : [];
+    res.json({ providers });
+  });
 
   router.get("/get-session", async (req, res) => {
     if (req.actor.type !== "board" || !req.actor.userId) {

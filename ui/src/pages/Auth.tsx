@@ -19,6 +19,17 @@ export function AuthPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [oidcPending, setOidcPending] = useState<string | null>(null);
+
+  // Divergência de fork declarada sob ADR-012 (Taskblu Co-Working Assistant).
+  // Sem provedor configurado a consulta devolve lista vazia e a tela fica
+  // exatamente como era.
+  const { data: oidcProviders = [] } = useQuery({
+    queryKey: ["auth", "oidc-providers"],
+    queryFn: () => authApi.listOidcProviders(),
+    retry: false,
+    staleTime: 5 * 60 * 1000,
+  });
 
   const nextPath = useMemo(
     () => searchParams.get("next") || getRememberedInvitePath() || "/",
@@ -90,6 +101,35 @@ export function AuthPage() {
               ? "Use your email and password to access this instance."
               : "Create an account for this instance. Email confirmation is not required in v1."}
           </p>
+
+          {oidcProviders.length > 0 && (
+            <div className="mt-6">
+              {oidcProviders.map((provider) => (
+                <Button
+                  key={provider.id}
+                  type="button"
+                  variant="outline"
+                  className="w-full"
+                  disabled={oidcPending !== null}
+                  onClick={() => {
+                    setError(null);
+                    setOidcPending(provider.id);
+                    authApi.startOidcSignIn(provider.id, nextPath).catch((cause: unknown) => {
+                      setOidcPending(null);
+                      setError(cause instanceof Error ? cause.message : "Sign-in failed");
+                    });
+                  }}
+                >
+                  {oidcPending === provider.id ? "Redirecting…" : `Sign in with ${provider.label}`}
+                </Button>
+              ))}
+              <div className="mt-4 flex items-center gap-3 text-xs text-muted-foreground">
+                <span className="h-px flex-1 bg-border" />
+                or
+                <span className="h-px flex-1 bg-border" />
+              </div>
+            </div>
+          )}
 
           <form
             className="mt-6 space-y-4"

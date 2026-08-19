@@ -114,3 +114,20 @@ describe("allowlist de prefixo no token solto", () => {
     expect(render("issue://ADR-019", ["TAS"])).toEqual(["/issues/ADR-019"]);
   });
 });
+
+describe("contrato de plugin do unified", () => {
+  it("a fabrica devolve um transformer, e nao uma arvore", () => {
+    // O unified chama o ATTACHER com as opcoes no freeze() e usa o retorno
+    // como transformer. Empurrar `fabrica(opcoes)` em remarkPlugins entrega o
+    // transformer no lugar do attacher: o unified o chama com as opcoes, a
+    // arvore chega indefinida e a pagina quebra.
+    const transformer = remarkLinkIssueReferences({ knownPrefixes: ["TAS"] });
+    expect(typeof transformer).toBe("function");
+  });
+
+  it("o transformer ignora uma arvore ausente em vez de derrubar a pagina", () => {
+    const transformer = remarkLinkIssueReferences({ knownPrefixes: ["TAS"] });
+    expect(() => transformer(undefined as never)).not.toThrow();
+    expect(() => transformer(null as never)).not.toThrow();
+  });
+});

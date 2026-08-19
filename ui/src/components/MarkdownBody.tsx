@@ -526,7 +526,7 @@ export function MarkdownBody({
     remarkPlugins.push(createRemarkWikiLinks({ wikiLinkRoot, resolveWikiLinkHref }));
   }
   if (linkIssueReferences) {
-    remarkPlugins.push(remarkLinkIssueReferences({ knownPrefixes }));
+    remarkPlugins.push([remarkLinkIssueReferences, { knownPrefixes }]);
   }
   if (softBreaks) {
     remarkPlugins.push(remarkSoftBreaks);

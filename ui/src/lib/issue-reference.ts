@@ -147,6 +147,11 @@ function linkifyIssueReferencesInText(
 }
 
 function rewriteMarkdownTree(node: MarkdownNode, knownPrefixes: ReadonlySet<string> | null) {
+  // Guarda contra no' ausente. Nao e' paranoia: registrar este plugin como
+  // `push(fabrica(opcoes))` em vez de `push([fabrica, opcoes])` faz o unified
+  // chamar o transformer no freeze() com `tree` indefinido, e o crash derruba
+  // a pagina inteira em vez de apenas nao linkar. Aconteceu.
+  if (!node || typeof node !== "object") return;
   if (!Array.isArray(node.children) || node.children.length === 0) return;
   if (node.type === "link" || node.type === "linkReference" || node.type === "code" || node.type === "definition" || node.type === "html") {
     return;

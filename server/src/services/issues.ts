@@ -38,6 +38,8 @@ import type {
   IssueBlockerAttention,
   IssueBlockedInboxAttention,
   IssueBlockedInboxIssueRef,
+  IssueBoardHealthAssignee,
+  IssueBoardHealthResponse,
   IssueProductivityReview,
   IssueProductivityReviewTrigger,
   IssueRelationIssueSummary,
@@ -413,6 +415,7 @@ async function listIssueDependencyReadinessMap(
         eq(issueRelations.companyId, companyId),
         eq(issueRelations.type, "blocks"),
         inArray(issueRelations.relatedIssueId, uniqueIssueIds),
+        eq(issues.companyId, companyId),
       ),
     );
 
@@ -1791,6 +1794,30 @@ async function blockedByMapForIssues(
   return map;
 }
 
+async function pendingInteractionCountMapForIssues(
+  dbOrTx: any,
+  companyId: string,
+  issueIds: string[],
+): Promise<Map<string, number>> {
+  const counts = new Map<string, number>();
+  const uniqueIssueIds = [...new Set(issueIds)];
+  if (uniqueIssueIds.length === 0) return counts;
+
+  for (const issueIdChunk of chunkList(uniqueIssueIds, ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
+    const rows = await dbOrTx
+      .select({ issueId: issueThreadInteractions.issueId })
+      .from(issueThreadInteractions)
+      .where(and(
+        eq(issueThreadInteractions.companyId, companyId),
+        eq(issueThreadInteractions.status, "pending"),
+        inArray(issueThreadInteractions.issueId, issueIdChunk),
+      ));
+    for (const row of rows) counts.set(row.issueId, (counts.get(row.issueId) ?? 0) + 1);
+  }
+
+  return counts;
+}
+
 const BLOCKED_INBOX_TERMINAL_STATUSES = ["done", "cancelled"] as const;
 const BLOCKED_INBOX_ACTIVE_RUN_STATUSES = ["queued", "running"] as const;
 const BLOCKED_INBOX_ACTIVE_WAKE_STATUSES = ["queued", "deferred_issue_execution"] as const;
@@ -3119,6 +3146,7 @@ export function issueService(db: Db) {
             eq(issueRelations.companyId, companyId),
             eq(issueRelations.type, "blocks"),
             inArray(issueRelations.relatedIssueId, uniqueIssueIds),
+            eq(issues.companyId, companyId),
           ),
         ),
       dbOrTx
@@ -3139,6 +3167,7 @@ export function issueService(db: Db) {
             eq(issueRelations.companyId, companyId),
             eq(issueRelations.type, "blocks"),
             inArray(issueRelations.issueId, uniqueIssueIds),
+            eq(issues.companyId, companyId),
           ),
         ),
     ]);
@@ -3623,6 +3652,116 @@ export function issueService(db: Db) {
           }),
         };
       });
+    },
+
+    listBoardHealth: async (companyId: string): Promise<IssueBoardHealthResponse> => {
+      const rows = await db
+        .select({
+          id: issues.id,
+          identifier: issues.identifier,
+          title: issues.title,
+          status: issues.status,
+          priority: issues.priority,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
+        })
+        .from(issues)
+        .where(and(
+          eq(issues.companyId, companyId),
+          isNull(issues.hiddenAt),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ))
+        .orderBy(desc(issues.updatedAt), desc(issues.id));
+
+      if (rows.length === 0) {
+        return {
+          issues: [],
+          summary: {
+            openIssueCount: 0,
+            blockedIssueCount: 0,
+            blockedWithoutBlockerCount: 0,
+            assignedToErrorAgentCount: 0,
+            issuesWithPendingInteractionCount: 0,
+          },
+        };
+      }
+
+      const issueIds = rows.map((row) => row.id);
+      const assigneeAgentIds = [
+        ...new Set(rows.map((row) => row.assigneeAgentId).filter((id): id is string => Boolean(id))),
+      ];
+      const [relationMap, readinessMap, pendingInteractionCounts, assigneeRows] = await Promise.all([
+        getIssueRelationSummaryMap(companyId, issueIds),
+        listIssueDependencyReadinessMap(db, companyId, issueIds),
+        pendingInteractionCountMapForIssues(db, companyId, issueIds),
+        assigneeAgentIds.length > 0
+          ? db
+            .select({
+              id: agents.id,
+              name: agents.name,
+              role: agents.role,
+              title: agents.title,
+              status: agents.status,
+            })
+            .from(agents)
+            .where(and(eq(agents.companyId, companyId), inArray(agents.id, assigneeAgentIds)))
+          : Promise.resolve([]),
+      ]);
+      const assigneesById = new Map(assigneeRows.map((row) => [row.id, row]));
+
+      const healthIssues = rows.map((row) => {
+        const assignee = row.assigneeAgentId
+          ? (() => {
+              const agent = assigneesById.get(row.assigneeAgentId);
+              return {
+                type: "agent" as const,
+                agentId: row.assigneeAgentId,
+                userId: null,
+                name: agent?.name ?? null,
+                role: agent?.role ?? null,
+                title: agent?.title ?? null,
+                status: (agent?.status ?? null) as IssueBoardHealthAssignee["status"],
+              };
+            })()
+          : row.assigneeUserId
+            ? {
+                type: "user" as const,
+                agentId: null,
+                userId: row.assigneeUserId,
+                name: null,
+                role: null,
+                title: null,
+                status: null,
+              }
+            : null;
+        const relations = relationMap.get(row.id) ?? { blockedBy: [], blocks: [] };
+        const pendingInteractionCount = pendingInteractionCounts.get(row.id) ?? 0;
+
+        return {
+          id: row.id,
+          identifier: row.identifier,
+          title: row.title,
+          status: row.status as IssueBoardHealthResponse["issues"][number]["status"],
+          priority: row.priority as IssueBoardHealthResponse["issues"][number]["priority"],
+          assignee,
+          blockedBy: relations.blockedBy,
+          unresolvedBlockerCount: readinessMap.get(row.id)?.unresolvedBlockerCount ?? 0,
+          pendingInteractionCount,
+        };
+      });
+
+      return {
+        issues: healthIssues,
+        summary: {
+          openIssueCount: healthIssues.length,
+          blockedIssueCount: healthIssues.filter((issue) => issue.status === "blocked").length,
+          blockedWithoutBlockerCount: healthIssues.filter(
+            (issue) => issue.status === "blocked" && issue.blockedBy.length === 0,
+          ).length,
+          assignedToErrorAgentCount: healthIssues.filter((issue) => issue.assignee?.status === "error").length,
+          issuesWithPendingInteractionCount: healthIssues.filter((issue) => issue.pendingInteractionCount > 0).length,
+        },
+      };
     },
 
     count: async (companyId: string, filters?: IssueFilters) => {

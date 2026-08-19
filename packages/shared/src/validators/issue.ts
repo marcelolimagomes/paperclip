@@ -23,6 +23,7 @@ import {
   ISSUE_STATUSES,
   ISSUE_THREAD_INTERACTION_CONTINUATION_POLICIES,
   ISSUE_THREAD_INTERACTION_KINDS,
+  ISSUE_THREAD_INTERACTION_RESOLVER_POLICIES,
   ISSUE_THREAD_INTERACTION_STATUSES,
   MODEL_PROFILE_KEYS,
 } from "../constants.js";
@@ -539,6 +540,7 @@ export type AddIssueComment = z.infer<typeof addIssueCommentSchema>;
 
 export const issueThreadInteractionStatusSchema = z.enum(ISSUE_THREAD_INTERACTION_STATUSES);
 export const issueThreadInteractionKindSchema = z.enum(ISSUE_THREAD_INTERACTION_KINDS);
+export const issueThreadInteractionResolverPolicySchema = z.enum(ISSUE_THREAD_INTERACTION_RESOLVER_POLICIES);
 export const issueThreadInteractionContinuationPolicySchema = z.enum(
   ISSUE_THREAD_INTERACTION_CONTINUATION_POLICIES,
 );
@@ -724,8 +726,14 @@ export const requestConfirmationResultSchema = z.object({
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),
 });
 
+const createIssueThreadInteractionCommon = {
+  resolverPolicy: issueThreadInteractionResolverPolicySchema.optional(),
+  addresseeAgentId: z.string().uuid().nullable().optional(),
+};
+
 export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
   z.object({
+    ...createIssueThreadInteractionCommon,
     kind: z.literal("suggest_tasks"),
     idempotencyKey: z.string().trim().max(255).nullable().optional(),
     sourceCommentId: z.string().uuid().nullable().optional(),
@@ -736,6 +744,7 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     payload: suggestTasksPayloadSchema,
   }),
   z.object({
+    ...createIssueThreadInteractionCommon,
     kind: z.literal("ask_user_questions"),
     idempotencyKey: z.string().trim().max(255).nullable().optional(),
     sourceCommentId: z.string().uuid().nullable().optional(),
@@ -746,6 +755,7 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     payload: askUserQuestionsPayloadSchema,
   }),
   z.object({
+    ...createIssueThreadInteractionCommon,
     kind: z.literal("request_confirmation"),
     idempotencyKey: z.string().trim().max(255).nullable().optional(),
     sourceCommentId: z.string().uuid().nullable().optional(),

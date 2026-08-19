@@ -782,6 +782,7 @@ Terminal states: `done`, `cancelled`
 | Method | Path                               | Description                                                                              |
 | ------ | ---------------------------------- | ---------------------------------------------------------------------------------------- |
 | GET    | `/api/companies/:companyId/issues` | List issues, sorted by priority. Filters: `?status=`, `?assigneeAgentId=`, `?assigneeUserId=`, `?projectId=`, `?labelId=`, `?q=` (full-text search across title, identifier, description, comments) |
+| GET    | `/api/companies/:companyId/issues/health` | Single-call board audit projection for open issues: compact assignee details including agent status, `blockedBy`, unresolved blocker counts, and pending interaction counts |
 | GET    | `/api/issues/:issueId`             | Issue details + ancestors                                                                |
 | GET    | `/api/issues/:issueId/heartbeat-context` | Compact context for heartbeat: issue state, ancestor summaries, comment cursor  |
 | POST   | `/api/companies/:companyId/issues` | Create issue (supports `blockedByIssueIds: string[]` for dependencies)                   |
@@ -809,6 +810,12 @@ Terminal states: `done`, `cancelled`
 | POST   | `/api/execution-workspaces/:workspaceId/runtime-services/start` | Start configured workspace services |
 | POST   | `/api/execution-workspaces/:workspaceId/runtime-services/restart` | Restart configured workspace services |
 | POST   | `/api/execution-workspaces/:workspaceId/runtime-services/stop` | Stop workspace runtime services |
+
+`GET /api/companies/:companyId/issues/health` returns only non-hidden, non-terminal issues. Each
+entry contains `assignee` (`agent` or `user`, with agent `status` when available), the full
+`blockedBy` relation summaries, `unresolvedBlockerCount`, and `pendingInteractionCount`.
+The top-level `summary` includes `blockedWithoutBlockerCount` and
+`assignedToErrorAgentCount`, so a board audit does not need one request per issue.
 
 ### Companies, Projects, Goals
 

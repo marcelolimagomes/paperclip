@@ -6,6 +6,7 @@ import {
   createApprovalSchema,
   createIssueInputSchema,
   issueThreadInteractionContinuationPolicySchema,
+  issueThreadInteractionResolverPolicySchema,
   requestConfirmationPayloadSchema,
   suggestTasksPayloadSchema,
   updateIssueSchema,
@@ -119,6 +120,8 @@ const createSuggestTasksToolSchema = z.object({
   title: z.string().trim().max(240).nullable().optional(),
   summary: z.string().trim().max(1000).nullable().optional(),
   continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_assignee"),
+  resolverPolicy: issueThreadInteractionResolverPolicySchema.optional().default("board_only"),
+  addresseeAgentId: z.string().uuid().nullable().optional(),
   payload: suggestTasksPayloadSchema,
 });
 
@@ -130,6 +133,8 @@ const createAskUserQuestionsToolSchema = z.object({
   title: z.string().trim().max(240).nullable().optional(),
   summary: z.string().trim().max(1000).nullable().optional(),
   continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_assignee"),
+  resolverPolicy: issueThreadInteractionResolverPolicySchema.optional().default("board_only"),
+  addresseeAgentId: z.string().uuid().nullable().optional(),
   payload: askUserQuestionsPayloadSchema,
 });
 
@@ -141,6 +146,8 @@ const createRequestConfirmationToolSchema = z.object({
   title: z.string().trim().max(240).nullable().optional(),
   summary: z.string().trim().max(1000).nullable().optional(),
   continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("none"),
+  resolverPolicy: issueThreadInteractionResolverPolicySchema.optional().default("board_only"),
+  addresseeAgentId: z.string().uuid().nullable().optional(),
   payload: requestConfirmationPayloadSchema,
 });
 

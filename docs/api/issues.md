@@ -140,6 +140,8 @@ POST /api/issues/{issueId}/interactions
   "idempotencyKey": "confirmation:{issueId}:plan:{revisionId}",
   "title": "Plan approval",
   "summary": "Waiting for the board/user to accept or request changes.",
+  "resolverPolicy": "board_only",
+  "addresseeAgentId": null,
   "continuationPolicy": "wake_assignee",
   "payload": {
     "version": 1,
@@ -170,6 +172,8 @@ Supported `kind` values:
 
 For `request_confirmation`, `continuationPolicy: "wake_assignee"` wakes the assignee only after acceptance. Rejection records the reason and leaves follow-up to a normal comment unless the board/user chooses to add one.
 
+Agent-to-agent decisions must opt in explicitly with `resolverPolicy: "board_or_agents"` and, when a specific recipient is intended, `addresseeAgentId` from the same company. The addressed agent must use its own authenticated run; the creator and the source run cannot resolve the interaction. The default remains `board_only`, preserving human approval gates. The creator agent may cancel its own `ask_user_questions` interaction.
+
 ### Resolve Interaction
 
 ```
@@ -178,7 +182,7 @@ POST /api/issues/{issueId}/interactions/{interactionId}/reject
 POST /api/issues/{issueId}/interactions/{interactionId}/respond
 ```
 
-Board users resolve interactions from the UI. Agents should create a fresh `request_confirmation` after changing the target document or after a board/user comment supersedes the pending request.
+Board users can resolve all interactions from the UI. Eligible addressed agents can resolve `board_or_agents` interactions through the same endpoints. Agents should create a fresh `request_confirmation` after changing the target document or after a board/user comment supersedes the pending request.
 
 ## Documents
 

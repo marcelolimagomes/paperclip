@@ -1332,6 +1332,66 @@ export function issueRoutes(
     return true;
   }
 
+  async function assertIssueThreadInteractionResolutionAllowed(
+    req: Request,
+    res: Response,
+    issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null },
+    interaction: {
+      createdByAgentId?: string | null;
+      sourceRunId?: string | null;
+      effectiveResolverPolicy?: string | null;
+      addresseeAgentId?: string | null;
+    },
+  ) {
+    if (req.actor.type !== "agent") {
+      assertBoard(req);
+      return true;
+    }
+
+    const actorAgentId = req.actor.agentId;
+    const runId = requireAgentRunId(req, res);
+    if (!actorAgentId || !runId) return false;
+    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return false;
+    if ((interaction.effectiveResolverPolicy ?? "board_only") !== "board_or_agents") {
+      res.status(403).json({ error: "This issue-thread interaction is board-only" });
+      return false;
+    }
+    if (interaction.addresseeAgentId && interaction.addresseeAgentId !== actorAgentId) {
+      res.status(403).json({ error: "Only the addressed agent or a board user may resolve this issue-thread interaction" });
+      return false;
+    }
+    if (interaction.createdByAgentId === actorAgentId) {
+      res.status(403).json({ error: "Agents cannot resolve interactions they created" });
+      return false;
+    }
+    if (interaction.sourceRunId && interaction.sourceRunId === runId) {
+      res.status(403).json({ error: "Agents cannot resolve interactions created by the same run" });
+      return false;
+    }
+    return true;
+  }
+
+  async function assertIssueThreadInteractionCancellationAllowed(
+    req: Request,
+    res: Response,
+    interaction: { createdByAgentId?: string | null },
+  ) {
+    if (req.actor.type !== "agent") {
+      assertBoard(req);
+      return true;
+    }
+
+    const runId = requireAgentRunId(req, res);
+    if (!runId) return false;
+    if (interaction.createdByAgentId !== req.actor.agentId) {
+      res.status(403).json({ error: "Only the agent that created this interaction or a board user may cancel it" });
+      return false;
+    }
+    // Cancelling one's own interaction is intentionally independent of issue
+    // checkout ownership: it only withdraws the creator's pending request.
+    return true;
+  }
+
   function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
     if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
     const context = contextSnapshot as Record<string, unknown>;
@@ -1847,6 +1907,12 @@ export function issueRoutes(
       successfulRunHandoff: handoffStates.get(issue.id) ?? null,
       activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
     })));
+  });
+
+  router.get("/companies/:companyId/issues/health", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    res.json(await svc.listBoardHealth(companyId));
   });
 
   router.get("/companies/:companyId/issues/count", async (req, res) => {
@@ -4532,11 +4598,16 @@ export function issueRoutes(
         return;
       }
       assertCompanyAccess(req, issue.companyId);
-      assertBoard(req);
+      const interactionSvc = issueThreadInteractionService(db);
+      const currentInteraction = req.actor.type === "agent"
+        ? await interactionSvc.getForIssue(issue, interactionId)
+        : null;
+      if (!(await assertIssueThreadInteractionResolutionAllowed(req, res, issue, currentInteraction ?? {}))) return;
 
       const actor = getActorInfo(req);
-      const { interaction, createdIssues, continuationIssue } = await issueThreadInteractionService(db).acceptInteraction(issue, interactionId, req.body, {
+      const { interaction, createdIssues, continuationIssue } = await interactionSvc.acceptInteraction(issue, interactionId, req.body, {
         agentId: actor.agentId,
+        runId: actor.runId,
         userId: actor.actorType === "user" ? actor.actorId : null,
       });
       const continuationWakeIssue = continuationIssue ?? issue;
@@ -4635,11 +4706,16 @@ export function issueRoutes(
         return;
       }
       assertCompanyAccess(req, issue.companyId);
-      assertBoard(req);
+      const interactionSvc = issueThreadInteractionService(db);
+      const currentInteraction = req.actor.type === "agent"
+        ? await interactionSvc.getForIssue(issue, interactionId)
+        : null;
+      if (!(await assertIssueThreadInteractionResolutionAllowed(req, res, issue, currentInteraction ?? {}))) return;
 
       const actor = getActorInfo(req);
-      const interaction = await issueThreadInteractionService(db).rejectInteraction(issue, interactionId, req.body, {
+      const interaction = await interactionSvc.rejectInteraction(issue, interactionId, req.body, {
         agentId: actor.agentId,
+        runId: actor.runId,
         userId: actor.actorType === "user" ? actor.actorId : null,
       });
 
@@ -4691,11 +4767,16 @@ export function issueRoutes(
         return;
       }
       assertCompanyAccess(req, issue.companyId);
-      assertBoard(req);
+      const interactionSvc = issueThreadInteractionService(db);
+      const currentInteraction = req.actor.type === "agent"
+        ? await interactionSvc.getForIssue(issue, interactionId)
+        : null;
+      if (!(await assertIssueThreadInteractionResolutionAllowed(req, res, issue, currentInteraction ?? {}))) return;
 
       const actor = getActorInfo(req);
-      const interaction = await issueThreadInteractionService(db).answerQuestions(issue, interactionId, req.body, {
+      const interaction = await interactionSvc.answerQuestions(issue, interactionId, req.body, {
         agentId: actor.agentId,
+        runId: actor.runId,
         userId: actor.actorType === "user" ? actor.actorId : null,
       });
 
@@ -4743,11 +4824,16 @@ export function issueRoutes(
         return;
       }
       assertCompanyAccess(req, issue.companyId);
-      assertBoard(req);
+      const interactionSvc = issueThreadInteractionService(db);
+      const currentInteraction = req.actor.type === "agent"
+        ? await interactionSvc.getForIssue(issue, interactionId)
+        : null;
+      if (!(await assertIssueThreadInteractionCancellationAllowed(req, res, currentInteraction ?? {}))) return;
 
       const actor = getActorInfo(req);
-      const interaction = await issueThreadInteractionService(db).cancelQuestions(issue, interactionId, req.body, {
+      const interaction = await interactionSvc.cancelQuestions(issue, interactionId, req.body, {
         agentId: actor.agentId,
+        runId: actor.runId,
         userId: actor.actorType === "user" ? actor.actorId : null,
       });
 

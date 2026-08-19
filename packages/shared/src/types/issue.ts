@@ -23,8 +23,10 @@ import type {
   ModelProfileKey,
   IssueThreadInteractionContinuationPolicy,
   IssueThreadInteractionKind,
+  IssueThreadInteractionResolverPolicy,
   IssueThreadInteractionStatus,
   IssueStatus,
+  AgentStatus,
 } from "../constants.js";
 import type { Goal } from "./goal.js";
 import type { Project, ProjectWorkspace } from "./project.js";
@@ -139,6 +141,41 @@ export interface IssueRelationIssueSummary {
   assigneeUserId: string | null;
   terminalBlockers?: IssueRelationIssueSummary[];
   activeRecoveryAction?: IssueRecoveryAction | null;
+}
+
+export interface IssueBoardHealthAssignee {
+  type: "agent" | "user";
+  agentId: string | null;
+  userId: string | null;
+  name: string | null;
+  role: string | null;
+  title: string | null;
+  status: AgentStatus | null;
+}
+
+export interface IssueBoardHealthIssue {
+  id: string;
+  identifier: string | null;
+  title: string;
+  status: IssueStatus;
+  priority: IssuePriority;
+  assignee: IssueBoardHealthAssignee | null;
+  blockedBy: IssueRelationIssueSummary[];
+  unresolvedBlockerCount: number;
+  pendingInteractionCount: number;
+}
+
+export interface IssueBoardHealthSummary {
+  openIssueCount: number;
+  blockedIssueCount: number;
+  blockedWithoutBlockerCount: number;
+  assignedToErrorAgentCount: number;
+  issuesWithPendingInteractionCount: number;
+}
+
+export interface IssueBoardHealthResponse {
+  issues: IssueBoardHealthIssue[];
+  summary: IssueBoardHealthSummary;
 }
 
 export type IssueBlockerAttentionState = "none" | "covered" | "stalled" | "needs_attention";
@@ -590,6 +627,7 @@ export interface IssueThreadInteractionActorFields {
   createdByAgentId?: string | null;
   createdByUserId?: string | null;
   resolvedByAgentId?: string | null;
+  resolvedByRunId?: string | null;
   resolvedByUserId?: string | null;
 }
 
@@ -721,10 +759,14 @@ export interface IssueThreadInteractionBase extends IssueThreadInteractionActorF
   idempotencyKey?: string | null;
   sourceCommentId?: string | null;
   sourceRunId?: string | null;
+  addresseeAgentId?: string | null;
   title?: string | null;
   summary?: string | null;
   status: IssueThreadInteractionStatus;
   continuationPolicy: IssueThreadInteractionContinuationPolicy;
+  resolverPolicy: IssueThreadInteractionResolverPolicy;
+  requestedResolverPolicy: IssueThreadInteractionResolverPolicy;
+  effectiveResolverPolicy: IssueThreadInteractionResolverPolicy;
   createdAt: Date | string;
   updatedAt: Date | string;
   resolvedAt?: Date | string | null;

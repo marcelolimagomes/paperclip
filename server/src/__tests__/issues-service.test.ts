@@ -15,6 +15,7 @@ import {
   issueComments,
   issueInboxArchives,
   issueRelations,
+  issueThreadInteractions,
   issues,
   projectWorkspaces,
   projects,
@@ -142,6 +143,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
   afterEach(async () => {
     await db.delete(issueComments);
+    await db.delete(issueThreadInteractions);
     await db.delete(issueRelations);
     await db.delete(issueInboxArchives);
     await db.delete(activityLog);
@@ -1349,6 +1351,114 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     ]);
     expect(byId.get(blockerId)?.blockedBy).toEqual([]);
     expect(byId.get(unblockedId)?.blockedBy).toEqual([]);
+  });
+
+  it("returns a tenant-scoped board health projection with assignee status and blockers", async () => {
+    const companyId = randomUUID();
+    const otherCompanyId = randomUUID();
+    const errorAgentId = randomUUID();
+    const blockerId = randomUUID();
+    const blockedWithoutBlockerId = randomUUID();
+    const blockedWithBlockerId = randomUUID();
+    const pendingIssueId = randomUUID();
+    const doneIssueId = randomUUID();
+    const otherTenantIssueId = randomUUID();
+
+    await db.insert(companies).values([
+      {
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      },
+      {
+        id: otherCompanyId,
+        name: "Other tenant",
+        issuePrefix: `T${otherCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      },
+    ]);
+    await db.insert(agents).values({
+      id: errorAgentId,
+      companyId,
+      name: "Broken agent",
+      role: "engineer",
+      status: "error",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "First-class blocker", status: "todo", priority: "high" },
+      {
+        id: blockedWithoutBlockerId,
+        companyId,
+        title: "Blocked without relation",
+        status: "blocked",
+        priority: "medium",
+      },
+      {
+        id: blockedWithBlockerId,
+        companyId,
+        title: "Blocked with relation",
+        status: "blocked",
+        priority: "medium",
+      },
+      {
+        id: pendingIssueId,
+        companyId,
+        title: "Assigned to an error agent",
+        status: "todo",
+        priority: "low",
+        assigneeAgentId: errorAgentId,
+      },
+      { id: doneIssueId, companyId, title: "Done issue", status: "done", priority: "medium" },
+      { id: otherTenantIssueId, companyId: otherCompanyId, title: "Other tenant issue", status: "blocked", priority: "high" },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: blockedWithBlockerId,
+      type: "blocks",
+    });
+    await db.insert(issueThreadInteractions).values({
+      companyId,
+      issueId: pendingIssueId,
+      kind: "ask_user_questions",
+      status: "pending",
+      payload: { version: 1, questions: [] },
+    });
+
+    const result = await svc.listBoardHealth(companyId);
+    const byId = new Map(result.issues.map((issue) => [issue.id, issue]));
+
+    expect(result.summary).toMatchObject({
+      openIssueCount: 4,
+      blockedIssueCount: 2,
+      blockedWithoutBlockerCount: 1,
+      assignedToErrorAgentCount: 1,
+      issuesWithPendingInteractionCount: 1,
+    });
+    expect(byId.has(doneIssueId)).toBe(false);
+    expect(byId.has(otherTenantIssueId)).toBe(false);
+    expect(byId.get(blockedWithoutBlockerId)).toMatchObject({
+      blockedBy: [],
+      unresolvedBlockerCount: 0,
+    });
+    expect(byId.get(blockedWithBlockerId)).toMatchObject({
+      blockedBy: [expect.objectContaining({ id: blockerId, title: "First-class blocker" })],
+      unresolvedBlockerCount: 1,
+    });
+    expect(byId.get(pendingIssueId)).toMatchObject({
+      assignee: {
+        type: "agent",
+        agentId: errorAgentId,
+        name: "Broken agent",
+        status: "error",
+      },
+      pendingInteractionCount: 1,
+    });
   });
 
   it("trims list payload fields that can grow large on issue index routes", async () => {

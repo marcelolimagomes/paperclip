@@ -11,6 +11,7 @@ const mockIssueService = vi.hoisted(() => ({
 
 const mockInteractionService = vi.hoisted(() => ({
   listForIssue: vi.fn(),
+  getForIssue: vi.fn(),
   create: vi.fn(),
   acceptInteraction: vi.fn(),
   acceptSuggestedTasks: vi.fn(),
@@ -705,6 +706,66 @@ describe.sequential("issue thread interaction routes", () => {
         agentId: CREATED_AGENT_ID,
         userId: null,
       },
+    );
+  });
+
+  it("allows the addressed agent to respond and records its run as resolver", async () => {
+    mockIssueService.getById.mockResolvedValueOnce(createIssue({ status: "todo" }));
+    mockInteractionService.getForIssue.mockResolvedValueOnce({
+      id: "interaction-2",
+      createdByAgentId: CREATED_AGENT_ID,
+      addresseeAgentId: ASSIGNEE_AGENT_ID,
+      effectiveResolverPolicy: "board_or_agents",
+      sourceRunId: "run-1",
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: ASSIGNEE_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-2",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/respond")
+      .send({ answers: [{ questionId: "scope", optionIds: ["phase-1"] }] });
+
+    expect(res.status).toBe(200);
+    expect(mockInteractionService.answerQuestions).toHaveBeenCalledWith(
+      expect.anything(),
+      "interaction-2",
+      expect.anything(),
+      expect.objectContaining({ agentId: ASSIGNEE_AGENT_ID, runId: "run-2", userId: null }),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ actorType: "agent", runId: "run-2" }),
+    );
+  });
+
+  it("allows the creating agent to cancel its own questions", async () => {
+    mockIssueService.getById.mockResolvedValueOnce(createIssue({ status: "todo" }));
+    mockInteractionService.getForIssue.mockResolvedValueOnce({
+      id: "interaction-2",
+      createdByAgentId: CREATED_AGENT_ID,
+      effectiveResolverPolicy: "board_only",
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-author",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/cancel")
+      .send({ reason: "No longer needed" });
+
+    expect(res.status).toBe(200);
+    expect(mockInteractionService.cancelQuestions).toHaveBeenCalledWith(
+      expect.anything(),
+      "interaction-2",
+      { reason: "No longer needed" },
+      expect.objectContaining({ agentId: CREATED_AGENT_ID, runId: "run-author", userId: null }),
     );
   });
 });

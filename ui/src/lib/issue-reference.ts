@@ -28,7 +28,7 @@ const BARE_TOKEN_PREFIX_RE = /^([A-Z][A-Z0-9]*)-\d+$/i;
  * o token NAO vira link: um link que aparece tarde e' melhor que uma rajada de
  * requisicoes para issues que nao existem.
  */
-function isKnownIssuePrefix(core: string, knownPrefixes: ReadonlySet<string> | null): boolean {
+export function isKnownIssuePrefix(core: string, knownPrefixes: ReadonlySet<string> | null): boolean {
   const bare = core.match(BARE_TOKEN_PREFIX_RE);
   if (!bare) return true;
   if (!knownPrefixes || knownPrefixes.size === 0) return false;

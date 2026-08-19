@@ -10,7 +10,7 @@ import { companiesApi } from "../api/companies";
 import { mentionChipInlineStyle, parseMentionChipHref } from "../lib/mention-chips";
 import { issuesApi } from "../api/issues";
 import { queryKeys } from "../lib/queryKeys";
-import { parseIssueReferenceFromHref, remarkLinkIssueReferences } from "../lib/issue-reference";
+import { isKnownIssuePrefix, parseIssueReferenceFromHref, remarkLinkIssueReferences } from "../lib/issue-reference";
 import { remarkSoftBreaks } from "../lib/remark-soft-breaks";
 import { StatusIcon } from "./StatusIcon";
 
@@ -36,15 +36,29 @@ let mermaidLoaderPromise: Promise<typeof import("mermaid").default> | null = nul
 
 function MarkdownIssueLink({
   issuePathId,
+  knownPrefixes,
   children,
 }: {
   issuePathId: string;
+  knownPrefixes: ReadonlySet<string> | null;
   children: ReactNode;
 }) {
+  // O link continua sendo renderizado; o que fica condicionado e' a BUSCA.
+  // Ela existe so para exibir titulo e status, e um identificador cujo prefixo
+  // nao pertence a nenhum projeto nunca vai resolver -- rende 404 por token, a
+  // cada evento de WebSocket, porque o live-updates invalida e tudo refaz.
+  //
+  // O linkificador de texto ja filtra o token solto, mas este componente
+  // tambem e' alcancado pelo renderizador de ancora, que resolve href
+  // explicito (`issue://`, `/co/issues/X-1`) sem olhar prefixo. Sem esta
+  // guarda, aquele caminho continua buscando o que nao existe.
+  const podeResolver = isKnownIssuePrefix(issuePathId, knownPrefixes);
   const { data } = useQuery({
     queryKey: queryKeys.issues.detail(issuePathId),
     queryFn: () => issuesApi.get(issuePathId),
     staleTime: 60_000,
+    enabled: podeResolver,
+    retry: false,
   });
 
   const identifier = data?.identifier ?? issuePathId;
@@ -521,6 +535,11 @@ export function MarkdownBody({
       .filter((prefix): prefix is string => typeof prefix === "string" && prefix.length > 0);
   }, [companiesForPrefixes]);
 
+  const knownPrefixSet = useMemo(
+    () => (knownPrefixes.length > 0 ? new Set(knownPrefixes.map((p) => p.toUpperCase())) : null),
+    [knownPrefixes],
+  );
+
   const remarkPlugins: NonNullable<Options["remarkPlugins"]> = [remarkGfm];
   if (enableWikiLinks) {
     remarkPlugins.push(createRemarkWikiLinks({ wikiLinkRoot, resolveWikiLinkHref }));
@@ -595,7 +614,7 @@ export function MarkdownBody({
       const issueRef = linkIssueReferences ? parseIssueReferenceFromHref(href) : null;
       if (issueRef) {
         return (
-          <MarkdownIssueLink issuePathId={issueRef.issuePathId}>
+          <MarkdownIssueLink issuePathId={issueRef.issuePathId} knownPrefixes={knownPrefixSet}>
             {linkChildren}
           </MarkdownIssueLink>
         );

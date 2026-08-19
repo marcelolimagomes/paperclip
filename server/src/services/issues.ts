@@ -2,6 +2,9 @@ import { Buffer } from "node:buffer";
 import { and, asc, desc, eq, gt, inArray, isNull, like, lt, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  costEvents,
+  feedbackVotes,
+  financeEvents,
   activityLog,
   agentWakeupRequests,
   agents,
@@ -4583,6 +4586,39 @@ export function issueService(db: Db) {
           .select({ documentId: issueDocuments.documentId })
           .from(issueDocuments)
           .where(eq(issueDocuments.issueId, id));
+
+        // As oito referencias que bloqueiam o delete sao soltas ANTES dele.
+        //
+        // Das 31 FKs que apontam para `issues`, 23 ja declaram CASCADE ou SET
+        // NULL; estas oito ficaram em ON DELETE NO ACTION, entao o endpoint
+        // devolvia 500 para qualquer issue com comentario, leitura, voto ou
+        // custo -- ou seja, para toda issue em que alguem trabalhou. Eram 54
+        // so nesta instancia. Corrigir uma de cada vez apenas revela a
+        // proxima: o primeiro ensaio morreu em cost_events, o segundo em
+        // issue_comments. Por isso as oito sao tratadas juntas.
+        //
+        // O tratamento segue a nulabilidade da coluna, que e' onde o schema
+        // registra a intencao:
+        //
+        //   nullable -> SET NULL. O registro vale por si (um gasto tem valor,
+        //               agente e data); apaga-lo para viabilizar o delete
+        //               trocaria um erro visivel por perda silenciosa de
+        //               historico financeiro.
+        //   NOT NULL -> DELETE. Sao estados por issue (comentario, leitura,
+        //               voto); sem a issue nao significam nada.
+        await tx.update(costEvents).set({ issueId: null }).where(eq(costEvents.issueId, id));
+        await tx.update(financeEvents).set({ issueId: null }).where(eq(financeEvents.issueId, id));
+
+        // Sub-issues sobem para a raiz em vez de serem apagadas junto. Apagar
+        // uma subarvore inteira porque o pai saiu e' destrutivo e
+        // surpreendente; orfa no topo o usuario ve e decide.
+        await tx.update(issues).set({ parentId: null }).where(eq(issues.parentId, id));
+
+        await tx.delete(issueComments).where(eq(issueComments.issueId, id));
+        await tx.delete(issueReadStates).where(eq(issueReadStates.issueId, id));
+        await tx.delete(issueInboxArchives).where(eq(issueInboxArchives.issueId, id));
+        await tx.delete(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, id));
+        await tx.delete(feedbackVotes).where(eq(feedbackVotes.issueId, id));
 
         const removedIssue = await tx
           .delete(issues)

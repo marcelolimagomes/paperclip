@@ -1,5 +1,5 @@
 import type { Request } from "express";
-import { forbidden, unauthorized } from "../errors.js";
+import { ERROR_CODES, forbidden, unauthorized } from "../errors.js";
 
 export function assertAuthenticated(req: Request) {
   if (req.actor.type === "none") {
@@ -9,7 +9,7 @@ export function assertAuthenticated(req: Request) {
 
 export function assertBoard(req: Request) {
   if (req.actor.type !== "board") {
-    throw forbidden("Board access required");
+    throw forbidden("Board access required", ERROR_CODES.boardAccessRequired);
   }
 }
 
@@ -42,7 +42,7 @@ export function assertInstanceAdmin(req: Request) {
 export function assertCompanyAccess(req: Request, companyId: string) {
   assertAuthenticated(req);
   if (req.actor.type === "agent" && req.actor.companyId !== companyId) {
-    throw forbidden("Agent key cannot access another company");
+    throw forbidden("Agent key cannot access another company", ERROR_CODES.agentCrossCompanyAccess);
   }
   if (req.actor.type === "board" && req.actor.source !== "local_implicit") {
     const allowedCompanies = req.actor.companyIds ?? [];
@@ -54,10 +54,13 @@ export function assertCompanyAccess(req: Request, companyId: string) {
     if (!isSafeMethod && !req.actor.isInstanceAdmin && Array.isArray(req.actor.memberships)) {
       const membership = req.actor.memberships.find((item) => item.companyId === companyId);
       if (!membership || membership.status !== "active") {
-        throw forbidden("User does not have active company access");
+        throw forbidden(
+          "User does not have active company access",
+          ERROR_CODES.companyMembershipInactive,
+        );
       }
       if (membership.membershipRole === "viewer") {
-        throw forbidden("Viewer access is read-only");
+        throw forbidden("Viewer access is read-only", ERROR_CODES.viewerAccessReadOnly);
       }
     }
   }

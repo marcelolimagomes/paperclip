@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import express from "express";
 import request from "supertest";
+import { ERROR_CODES } from "../errors.js";
 import { boardMutationGuard } from "../middleware/board-mutation-guard.js";
 
 function createApp(
@@ -51,6 +52,7 @@ describe("boardMutationGuard", () => {
     expect(res.status).toHaveBeenCalledWith(403);
     expect(res.json).toHaveBeenCalledWith({
       error: "Board mutation requires trusted browser origin",
+      code: ERROR_CODES.trustedBrowserOriginRequired,
     });
   });
 
@@ -125,6 +127,7 @@ describe("boardMutationGuard", () => {
     expect(res.status).toHaveBeenCalledWith(403);
     expect(res.json).toHaveBeenCalledWith({
       error: "Board mutation requires trusted browser origin",
+      code: ERROR_CODES.trustedBrowserOriginRequired,
     });
   });
 

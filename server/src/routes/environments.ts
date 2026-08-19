@@ -7,7 +7,7 @@ import {
   probeEnvironmentConfigSchema,
   updateEnvironmentSchema,
 } from "@paperclipai/shared";
-import { forbidden } from "../errors.js";
+import { ERROR_CODES, forbidden } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import {
   accessService,
@@ -75,7 +75,7 @@ export function environmentRoutes(
 
     const actorAgent = await agents.getById(req.actor.agentId);
     if (!actorAgent || actorAgent.companyId !== companyId) {
-      throw forbidden("Agent key cannot access another company");
+      throw forbidden("Agent key cannot access another company", ERROR_CODES.agentCrossCompanyAccess);
     }
 
     const allowedByGrant = await access.hasPermission(companyId, "agent", actorAgent.id, "environments:manage");

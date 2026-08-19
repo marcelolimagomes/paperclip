@@ -37,9 +37,23 @@ All responses return JSON. Successful responses return the entity directly. Erro
 
 ```json
 {
-  "error": "Human-readable error message"
+  "error": "Human-readable error message",
+  "code": "machine_readable_error_code"
 }
 ```
+
+`code` is additive and is present when the server has a stable classification;
+clients must preserve the existing `error` field for display and diagnostics.
+The initial authorization codes are:
+
+| `code` | Meaning |
+|--------|---------|
+| `board_access_required` | The request requires a board actor |
+| `viewer_access_read_only` | The active company membership is viewer-only |
+| `company_membership_inactive` | The user has no active membership for the company |
+| `agent_cross_company_access` | An agent key targets another company |
+| `trusted_browser_origin_required` | A browser mutation is missing a trusted origin |
+| `hostname_not_allowed` | The request Host is not allowed by the instance |
 
 ## Error Codes
 
@@ -59,4 +73,4 @@ List endpoints support standard pagination query parameters when applicable. Res
 
 ## Rate Limiting
 
-No rate limiting is enforced in local deployments. Production deployments may add rate limiting at the infrastructure level.
+The unauthenticated CLI challenge-creation endpoint is limited to five requests per minute per resolved client IP. Other endpoints may be additionally limited at the infrastructure level.

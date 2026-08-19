@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from "node:util";
 import { and, asc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  agents,
   documents,
   heartbeatRuns,
   issueComments,
@@ -16,6 +17,7 @@ import type {
   CancelIssueThreadInteraction,
   CreateIssueThreadInteraction,
   IssueThreadInteraction,
+  IssueThreadInteractionResolverPolicy,
   RequestConfirmationInteraction,
   RequestConfirmationTarget,
   RejectIssueThreadInteraction,
@@ -35,11 +37,12 @@ import {
   suggestTasksPayloadSchema,
   suggestTasksResultSchema,
 } from "@paperclipai/shared";
-import { conflict, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { issueService } from "./issues.js";
 
 type InteractionActor = {
   agentId?: string | null;
+  runId?: string | null;
   userId?: string | null;
 };
 
@@ -61,6 +64,25 @@ type ResolvedInteractionResult = {
 
 type IssueThreadInteractionRow = typeof issueThreadInteractions.$inferSelect;
 type IssueTouchDb = Pick<Db, "update">;
+
+const DEFAULT_INTERACTION_RESOLVER_POLICY: IssueThreadInteractionResolverPolicy = "board_only";
+
+function assertAgentResolutionAllowed(current: IssueThreadInteractionRow, actor: InteractionActor) {
+  if (!actor.agentId) return;
+  if (!actor.runId) throw forbidden("Agent run id required to resolve an issue-thread interaction");
+  if ((current.effectiveResolverPolicy ?? DEFAULT_INTERACTION_RESOLVER_POLICY) !== "board_or_agents") {
+    throw forbidden("This issue-thread interaction is board-only");
+  }
+  if (current.addresseeAgentId && current.addresseeAgentId !== actor.agentId) {
+    throw forbidden("Only the addressed agent or a board user may resolve this issue-thread interaction");
+  }
+  if (current.createdByAgentId === actor.agentId) {
+    throw forbidden("Agents cannot resolve interactions they created");
+  }
+  if (current.sourceRunId && current.sourceRunId === actor.runId) {
+    throw forbidden("Agents cannot resolve interactions created by the same run");
+  }
+}
 
 type IssueResolutionContext = {
   id: string;
@@ -84,6 +106,9 @@ function isEquivalentCreateRequest(
 ) {
   return (
     row.kind === input.kind
+    && (row.requestedResolverPolicy ?? DEFAULT_INTERACTION_RESOLVER_POLICY)
+      === (input.resolverPolicy ?? DEFAULT_INTERACTION_RESOLVER_POLICY)
+    && (row.addresseeAgentId ?? null) === (input.addresseeAgentId ?? null)
     && row.continuationPolicy === input.continuationPolicy
     && (row.idempotencyKey ?? null) === (input.idempotencyKey ?? null)
     && (row.sourceCommentId ?? null) === (input.sourceCommentId ?? null)
@@ -102,8 +127,12 @@ function hydrateInteraction(
   const base = {
     ...row,
     idempotencyKey: row.idempotencyKey ?? null,
+    addresseeAgentId: row.addresseeAgentId ?? null,
     status: row.status as IssueThreadInteraction["status"],
     continuationPolicy: row.continuationPolicy as IssueThreadInteraction["continuationPolicy"],
+    resolverPolicy: row.requestedResolverPolicy ?? DEFAULT_INTERACTION_RESOLVER_POLICY,
+    requestedResolverPolicy: row.requestedResolverPolicy ?? DEFAULT_INTERACTION_RESOLVER_POLICY,
+    effectiveResolverPolicy: row.effectiveResolverPolicy ?? DEFAULT_INTERACTION_RESOLVER_POLICY,
   };
 
   switch (row.kind) {
@@ -409,6 +438,7 @@ async function expireStaleRequestConfirmationTarget(db: Db | any, args: {
         staleTarget: target,
       },
       resolvedByAgentId: args.actor.agentId ?? null,
+      resolvedByRunId: args.actor.runId ?? null,
       resolvedByUserId: args.actor.userId ?? null,
       resolvedAt: now,
       updatedAt: now,
@@ -446,6 +476,7 @@ export function issueThreadInteractionService(db: Db) {
   async function getPendingInteractionForResolution(args: {
     issue: { id: string; companyId: string };
     interactionId: string;
+    actor: InteractionActor;
   }) {
     const current = await db
       .select()
@@ -460,6 +491,7 @@ export function issueThreadInteractionService(db: Db) {
     if (current.status !== "pending") {
       throw conflict("Interaction has already been resolved");
     }
+    assertAgentResolutionAllowed(current, args.actor);
     return current;
   }
 
@@ -490,6 +522,7 @@ export function issueThreadInteractionService(db: Db) {
             outcome: "accepted",
           },
           resolvedByAgentId: args.actor.agentId ?? null,
+          resolvedByRunId: args.actor.runId ?? null,
           resolvedByUserId: args.actor.userId ?? null,
           resolvedAt: now,
           updatedAt: now,
@@ -585,6 +618,7 @@ export function issueThreadInteractionService(db: Db) {
           reason: reason || null,
         },
         resolvedByAgentId: args.actor.agentId ?? null,
+        resolvedByRunId: args.actor.runId ?? null,
         resolvedByUserId: args.actor.userId ?? null,
         resolvedAt: now,
         updatedAt: now,
@@ -623,12 +657,55 @@ export function issueThreadInteractionService(db: Db) {
       return row ? hydrateInteraction(row) : null;
     },
 
+    getForIssue: async (issue: { id: string; companyId: string }, interactionId: string) => {
+      const row = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, interactionId))
+        .then((rows) => rows[0] ?? null);
+
+      if (!row || row.companyId !== issue.companyId || row.issueId !== issue.id) {
+        throw notFound("Interaction not found");
+      }
+      return hydrateInteraction(row);
+    },
+
     create: async (
       issue: { id: string; companyId: string },
       input: CreateIssueThreadInteraction,
       actor: InteractionActor,
     ) => {
-      const data = createIssueThreadInteractionSchema.parse(input);
+      const parsed = createIssueThreadInteractionSchema.parse(input);
+      const data = {
+        ...parsed,
+        resolverPolicy: parsed.resolverPolicy ?? DEFAULT_INTERACTION_RESOLVER_POLICY,
+      };
+
+      if (data.addresseeAgentId) {
+        if (data.resolverPolicy !== "board_or_agents") {
+          throw unprocessable("addresseeAgentId requires resolverPolicy board_or_agents");
+        }
+        if (data.addresseeAgentId === actor.agentId) {
+          throw unprocessable("Agents cannot address issue-thread interactions to themselves");
+        }
+        const addressee = await db
+          .select({
+            id: agents.id,
+            companyId: agents.companyId,
+            status: agents.status,
+          })
+          .from(agents)
+          .where(eq(agents.id, data.addresseeAgentId))
+          .then((rows) => rows[0] ?? null);
+        if (!addressee || addressee.companyId !== issue.companyId) {
+          throw unprocessable("addresseeAgentId must belong to the same company");
+        }
+        if (!(addressee.status === "active" || addressee.status === "idle" || addressee.status === "running")) {
+          throw unprocessable("addresseeAgentId must reference an invokable agent", {
+            status: addressee.status,
+          });
+        }
+      }
 
       if (data.idempotencyKey) {
         const existing = await getIdempotentInteraction({
@@ -691,12 +768,15 @@ export function issueThreadInteractionService(db: Db) {
             kind: data.kind,
             status: "pending",
             continuationPolicy: data.continuationPolicy,
+            requestedResolverPolicy: data.resolverPolicy,
+            effectiveResolverPolicy: data.resolverPolicy,
             idempotencyKey: data.idempotencyKey ?? null,
             sourceCommentId: data.sourceCommentId ?? null,
             sourceRunId: data.sourceRunId ?? null,
             title: data.title ?? null,
             summary: data.summary ?? null,
             createdByAgentId: actor.agentId ?? null,
+            addresseeAgentId: data.addresseeAgentId ?? null,
             createdByUserId: actor.userId ?? null,
             payload: data.payload,
           })
@@ -730,7 +810,7 @@ export function issueThreadInteractionService(db: Db) {
       actor: InteractionActor,
     ): Promise<ResolvedInteractionResult> => {
       const data = acceptIssueThreadInteractionSchema.parse(input);
-      const current = await getPendingInteractionForResolution({ issue, interactionId });
+      const current = await getPendingInteractionForResolution({ issue, interactionId, actor });
       switch (current.kind) {
         case "suggest_tasks":
           return issueThreadInteractionService(db).acceptSuggestedTasks(issue, interactionId, data, actor);
@@ -773,6 +853,7 @@ export function issueThreadInteractionService(db: Db) {
       if (current.status !== "pending") {
         throw conflict("Interaction has already been resolved");
       }
+      assertAgentResolutionAllowed(current, actor);
 
       const interaction = hydrateInteraction(current) as SuggestTasksInteraction;
       const { selectedTasks, skippedClientKeys } = resolveSelectedSuggestedTasks({
@@ -813,6 +894,7 @@ export function issueThreadInteractionService(db: Db) {
           .set({
             status: "accepted",
             resolvedByAgentId: actor.agentId ?? null,
+            resolvedByRunId: actor.runId ?? null,
             resolvedByUserId: actor.userId ?? null,
             resolvedAt,
             updatedAt: resolvedAt,
@@ -905,7 +987,7 @@ export function issueThreadInteractionService(db: Db) {
       actor: InteractionActor,
     ) => {
       const data = rejectIssueThreadInteractionSchema.parse(input);
-      const current = await getPendingInteractionForResolution({ issue, interactionId });
+      const current = await getPendingInteractionForResolution({ issue, interactionId, actor });
       switch (current.kind) {
         case "suggest_tasks":
           return issueThreadInteractionService(db).rejectSuggestedTasks(issue, interactionId, data, actor, current);
@@ -937,6 +1019,7 @@ export function issueThreadInteractionService(db: Db) {
       if (current.status !== "pending") {
         throw conflict("Interaction has already been resolved");
       }
+      assertAgentResolutionAllowed(current, actor);
 
       const [updated] = await db
         .update(issueThreadInteractions)
@@ -947,6 +1030,7 @@ export function issueThreadInteractionService(db: Db) {
             rejectionReason: input.reason?.trim() || null,
           },
           resolvedByAgentId: actor.agentId ?? null,
+          resolvedByRunId: actor.runId ?? null,
           resolvedByUserId: actor.userId ?? null,
           resolvedAt: new Date(),
           updatedAt: new Date(),
@@ -1002,6 +1086,7 @@ export function issueThreadInteractionService(db: Db) {
               commentId: comment.id,
             },
             resolvedByAgentId: actor.agentId ?? null,
+            resolvedByRunId: actor.runId ?? null,
             resolvedByUserId: actor.userId ?? null,
             resolvedAt: now,
             updatedAt: now,
@@ -1077,6 +1162,7 @@ export function issueThreadInteractionService(db: Db) {
               staleTarget: target,
             },
             resolvedByAgentId: actor.agentId ?? null,
+            resolvedByRunId: actor.runId ?? null,
             resolvedByUserId: actor.userId ?? null,
             resolvedAt: now,
             updatedAt: now,
@@ -1117,6 +1203,7 @@ export function issueThreadInteractionService(db: Db) {
       if (current.status !== "pending") {
         throw conflict("Interaction has already been resolved");
       }
+      assertAgentResolutionAllowed(current, actor);
 
       const interaction = hydrateInteraction(current) as AskUserQuestionsInteraction;
       const normalizedAnswers = normalizeQuestionAnswers({
@@ -1134,6 +1221,7 @@ export function issueThreadInteractionService(db: Db) {
             summaryMarkdown: input.summaryMarkdown ?? null,
           },
           resolvedByAgentId: actor.agentId ?? null,
+          resolvedByRunId: actor.runId ?? null,
           resolvedByUserId: actor.userId ?? null,
           resolvedAt: new Date(),
           updatedAt: new Date(),
@@ -1175,6 +1263,9 @@ export function issueThreadInteractionService(db: Db) {
       if (current.status !== "pending") {
         throw conflict("Interaction has already been resolved");
       }
+      if (actor.agentId && current.createdByAgentId !== actor.agentId) {
+        throw forbidden("Only the agent that created this interaction or a board user may cancel it");
+      }
 
       const reason = data.reason?.trim() || null;
       const [updated] = await db
@@ -1189,6 +1280,7 @@ export function issueThreadInteractionService(db: Db) {
             summaryMarkdown: null,
           },
           resolvedByAgentId: actor.agentId ?? null,
+          resolvedByRunId: actor.runId ?? null,
           resolvedByUserId: actor.userId ?? null,
           resolvedAt: new Date(),
           updatedAt: new Date(),

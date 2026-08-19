@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { isDeepStrictEqual } from "node:util";
 import { and, asc, desc, eq, gt, inArray, isNull, like, lt, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -38,6 +39,8 @@ import type {
   IssueBlockerAttention,
   IssueBlockedInboxAttention,
   IssueBlockedInboxIssueRef,
+  IssueBoardHealthAssignee,
+  IssueBoardHealthResponse,
   IssueProductivityReview,
   IssueProductivityReviewTrigger,
   IssueRelationIssueSummary,
@@ -94,6 +97,7 @@ const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_LOG_BYTES = 2_000_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_CHUNK_BYTES = 256_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_END_SLACK_MS = 60_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_PARALLEL_READS = 8;
+const activeIssueIdempotencyKeys = new Set<string>();
 function assertTransition(from: string, to: string) {
   if (from === to) return;
   if (!ALL_ISSUE_STATUSES.includes(to)) {
@@ -298,6 +302,10 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   blockedByIssueIds?: string[];
   inheritExecutionWorkspaceFromIssueId?: string | null;
 };
+export type IssueCreateResult = {
+  issue: IssueWithLabels;
+  reused: boolean;
+};
 type IssueChildCreateInput = IssueCreateInput & {
   acceptanceCriteria?: string[];
   blockParentUntilDone?: boolean;
@@ -308,6 +316,53 @@ type IssueRelationSummaryMap = {
   blockedBy: IssueRelationIssueSummary[];
   blocks: IssueRelationIssueSummary[];
 };
+
+function normalizeIssueIdempotencyKey(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function issueIdempotencyConflict(idempotencyKey: string): HttpError {
+  return conflict("Issue idempotency key was concurrently used", {
+    code: "idempotency_key_reused",
+    idempotencyKey,
+  });
+}
+
+function isEquivalentIssueCreateRequest(
+  row: typeof issues.$inferSelect,
+  data: IssueCreateInput,
+): boolean {
+  const expectedStatus = data.status
+    ?? (data.assigneeAgentId || data.assigneeUserId ? "todo" : "backlog");
+  return (
+    row.idempotencyKey === normalizeIssueIdempotencyKey(data.idempotencyKey)
+    && row.title === data.title
+    && (row.description ?? null) === (data.description ?? null)
+    && row.status === expectedStatus
+    && row.workMode === (data.workMode ?? "standard")
+    && row.priority === (data.priority ?? "medium")
+    && row.projectId === (data.projectId ?? null)
+    && row.parentId === (data.parentId ?? null)
+    && row.assigneeAgentId === (data.assigneeAgentId ?? null)
+    && row.assigneeUserId === (data.assigneeUserId ?? null)
+    && row.requestDepth === clampIssueRequestDepth(data.requestDepth ?? 0)
+    && (row.billingCode ?? null) === (data.billingCode ?? null)
+    && isDeepStrictEqual(row.assigneeAdapterOverrides ?? null, data.assigneeAdapterOverrides ?? null)
+    && isDeepStrictEqual(row.executionPolicy ?? null, data.executionPolicy ?? null)
+    && (data.projectWorkspaceId === undefined || row.projectWorkspaceId === (data.projectWorkspaceId ?? null))
+    && (data.executionWorkspaceId === undefined || row.executionWorkspaceId === (data.executionWorkspaceId ?? null))
+    && (
+      data.executionWorkspacePreference === undefined
+      || row.executionWorkspacePreference === (data.executionWorkspacePreference ?? null)
+    )
+    && (
+      data.executionWorkspaceSettings === undefined
+      || isDeepStrictEqual(row.executionWorkspaceSettings ?? null, data.executionWorkspaceSettings ?? null)
+    )
+  );
+}
 export type IssueDependencyReadiness = {
   issueId: string;
   blockerIssueIds: string[];
@@ -413,6 +468,7 @@ async function listIssueDependencyReadinessMap(
         eq(issueRelations.companyId, companyId),
         eq(issueRelations.type, "blocks"),
         inArray(issueRelations.relatedIssueId, uniqueIssueIds),
+        eq(issues.companyId, companyId),
       ),
     );
 
@@ -1571,6 +1627,7 @@ const issueListSelect = {
   executionLockedAt: issues.executionLockedAt,
   createdByAgentId: issues.createdByAgentId,
   createdByUserId: issues.createdByUserId,
+  idempotencyKey: issues.idempotencyKey,
   issueNumber: issues.issueNumber,
   identifier: issues.identifier,
   originKind: issues.originKind,
@@ -1789,6 +1846,30 @@ async function blockedByMapForIssues(
   }
 
   return map;
+}
+
+async function pendingInteractionCountMapForIssues(
+  dbOrTx: any,
+  companyId: string,
+  issueIds: string[],
+): Promise<Map<string, number>> {
+  const counts = new Map<string, number>();
+  const uniqueIssueIds = [...new Set(issueIds)];
+  if (uniqueIssueIds.length === 0) return counts;
+
+  for (const issueIdChunk of chunkList(uniqueIssueIds, ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE)) {
+    const rows = await dbOrTx
+      .select({ issueId: issueThreadInteractions.issueId })
+      .from(issueThreadInteractions)
+      .where(and(
+        eq(issueThreadInteractions.companyId, companyId),
+        eq(issueThreadInteractions.status, "pending"),
+        inArray(issueThreadInteractions.issueId, issueIdChunk),
+      ));
+    for (const row of rows) counts.set(row.issueId, (counts.get(row.issueId) ?? 0) + 1);
+  }
+
+  return counts;
 }
 
 const BLOCKED_INBOX_TERMINAL_STATUSES = ["done", "cancelled"] as const;
@@ -3119,6 +3200,7 @@ export function issueService(db: Db) {
             eq(issueRelations.companyId, companyId),
             eq(issueRelations.type, "blocks"),
             inArray(issueRelations.relatedIssueId, uniqueIssueIds),
+            eq(issues.companyId, companyId),
           ),
         ),
       dbOrTx
@@ -3139,6 +3221,7 @@ export function issueService(db: Db) {
             eq(issueRelations.companyId, companyId),
             eq(issueRelations.type, "blocks"),
             inArray(issueRelations.issueId, uniqueIssueIds),
+            eq(issues.companyId, companyId),
           ),
         ),
     ]);
@@ -3625,6 +3708,116 @@ export function issueService(db: Db) {
       });
     },
 
+    listBoardHealth: async (companyId: string): Promise<IssueBoardHealthResponse> => {
+      const rows = await db
+        .select({
+          id: issues.id,
+          identifier: issues.identifier,
+          title: issues.title,
+          status: issues.status,
+          priority: issues.priority,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
+        })
+        .from(issues)
+        .where(and(
+          eq(issues.companyId, companyId),
+          isNull(issues.hiddenAt),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ))
+        .orderBy(desc(issues.updatedAt), desc(issues.id));
+
+      if (rows.length === 0) {
+        return {
+          issues: [],
+          summary: {
+            openIssueCount: 0,
+            blockedIssueCount: 0,
+            blockedWithoutBlockerCount: 0,
+            assignedToErrorAgentCount: 0,
+            issuesWithPendingInteractionCount: 0,
+          },
+        };
+      }
+
+      const issueIds = rows.map((row) => row.id);
+      const assigneeAgentIds = [
+        ...new Set(rows.map((row) => row.assigneeAgentId).filter((id): id is string => Boolean(id))),
+      ];
+      const [relationMap, readinessMap, pendingInteractionCounts, assigneeRows] = await Promise.all([
+        getIssueRelationSummaryMap(companyId, issueIds),
+        listIssueDependencyReadinessMap(db, companyId, issueIds),
+        pendingInteractionCountMapForIssues(db, companyId, issueIds),
+        assigneeAgentIds.length > 0
+          ? db
+            .select({
+              id: agents.id,
+              name: agents.name,
+              role: agents.role,
+              title: agents.title,
+              status: agents.status,
+            })
+            .from(agents)
+            .where(and(eq(agents.companyId, companyId), inArray(agents.id, assigneeAgentIds)))
+          : Promise.resolve([]),
+      ]);
+      const assigneesById = new Map(assigneeRows.map((row) => [row.id, row]));
+
+      const healthIssues = rows.map((row) => {
+        const assignee = row.assigneeAgentId
+          ? (() => {
+              const agent = assigneesById.get(row.assigneeAgentId);
+              return {
+                type: "agent" as const,
+                agentId: row.assigneeAgentId,
+                userId: null,
+                name: agent?.name ?? null,
+                role: agent?.role ?? null,
+                title: agent?.title ?? null,
+                status: (agent?.status ?? null) as IssueBoardHealthAssignee["status"],
+              };
+            })()
+          : row.assigneeUserId
+            ? {
+                type: "user" as const,
+                agentId: null,
+                userId: row.assigneeUserId,
+                name: null,
+                role: null,
+                title: null,
+                status: null,
+              }
+            : null;
+        const relations = relationMap.get(row.id) ?? { blockedBy: [], blocks: [] };
+        const pendingInteractionCount = pendingInteractionCounts.get(row.id) ?? 0;
+
+        return {
+          id: row.id,
+          identifier: row.identifier,
+          title: row.title,
+          status: row.status as IssueBoardHealthResponse["issues"][number]["status"],
+          priority: row.priority as IssueBoardHealthResponse["issues"][number]["priority"],
+          assignee,
+          blockedBy: relations.blockedBy,
+          unresolvedBlockerCount: readinessMap.get(row.id)?.unresolvedBlockerCount ?? 0,
+          pendingInteractionCount,
+        };
+      });
+
+      return {
+        issues: healthIssues,
+        summary: {
+          openIssueCount: healthIssues.length,
+          blockedIssueCount: healthIssues.filter((issue) => issue.status === "blocked").length,
+          blockedWithoutBlockerCount: healthIssues.filter(
+            (issue) => issue.status === "blocked" && issue.blockedBy.length === 0,
+          ).length,
+          assignedToErrorAgentCount: healthIssues.filter((issue) => issue.assignee?.status === "error").length,
+          issuesWithPendingInteractionCount: healthIssues.filter((issue) => issue.pendingInteractionCount > 0).length,
+        },
+      };
+    },
+
     count: async (companyId: string, filters?: IssueFilters) => {
       if (filters?.attention === "blocked") {
         return countBlockedInboxIssues(db, companyId, filters);
@@ -4012,22 +4205,32 @@ export function issueService(db: Db) {
       };
     },
 
-    create: async (
+    createWithResult: async (
       companyId: string,
       data: IssueCreateInput,
     ) => {
-      const {
-        labelIds: inputLabelIds,
-        blockedByIssueIds,
-        inheritExecutionWorkspaceFromIssueId,
-        ...issueData
-      } = data;
+      const activeKey = normalizeIssueIdempotencyKey(data.idempotencyKey);
+      if (activeKey) {
+        const activeKeyScope = `${companyId}:${activeKey}`;
+        if (activeIssueIdempotencyKeys.has(activeKeyScope)) {
+          throw issueIdempotencyConflict(activeKey);
+        }
+        activeIssueIdempotencyKeys.add(activeKeyScope);
+      }
+      try {
+        const {
+          labelIds: inputLabelIds,
+          blockedByIssueIds,
+          inheritExecutionWorkspaceFromIssueId,
+          ...issueData
+        } = data;
       const isolatedWorkspacesEnabled = (await instanceSettings.getExperimental()).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
         delete issueData.executionWorkspaceId;
         delete issueData.executionWorkspacePreference;
         delete issueData.executionWorkspaceSettings;
       }
+      issueData.idempotencyKey = normalizeIssueIdempotencyKey(issueData.idempotencyKey);
       if (data.assigneeAgentId && data.assigneeUserId) {
         throw unprocessable("Issue can only have one assignee");
       }
@@ -4040,7 +4243,33 @@ export function issueService(db: Db) {
       if (data.status === "in_progress" && !data.assigneeAgentId && !data.assigneeUserId) {
         throw unprocessable("in_progress issues require an assignee");
       }
-      return db.transaction(async (tx) => {
+      return await db.transaction(async (tx) => {
+        if (issueData.idempotencyKey) {
+          const lockRows = await tx.execute(sql`
+            SELECT pg_try_advisory_xact_lock(
+              hashtextextended(${`${companyId}:${issueData.idempotencyKey}`}, 0)
+            ) AS acquired
+          `) as Array<{ acquired?: boolean }>;
+          if (!lockRows[0]?.acquired) throw issueIdempotencyConflict(issueData.idempotencyKey);
+          const existing = await tx
+            .select()
+            .from(issues)
+            .where(and(
+              eq(issues.companyId, companyId),
+              eq(issues.idempotencyKey, issueData.idempotencyKey),
+            ))
+            .then((rows) => rows[0] ?? null);
+          if (existing) {
+            if (!isEquivalentIssueCreateRequest(existing, issueData)) {
+              throw conflict("Issue idempotency key already exists for a different request", {
+                code: "idempotency_key_reused",
+                idempotencyKey: issueData.idempotencyKey,
+              });
+            }
+            const [enriched] = await withIssueLabels(tx, [existing]);
+            return { issue: enriched, reused: true } satisfies IssueCreateResult;
+          }
+        }
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, companyId);
         const projectGoalId = await getProjectDefaultGoalId(tx, companyId, issueData.projectId);
         let projectWorkspaceId = issueData.projectWorkspaceId ?? null;
@@ -4224,7 +4453,23 @@ export function issueService(db: Db) {
           }),
         );
 
-        const [issue] = await tx.insert(issues).values(values).returning();
+        const idempotencyKey = normalizeIssueIdempotencyKey(issueData.idempotencyKey);
+        const idempotentInsert = idempotencyKey
+          ? tx
+              .insert(issues)
+              .values(values)
+              .onConflictDoNothing({
+                target: [issues.companyId, issues.idempotencyKey],
+                where: sql`${issues.idempotencyKey} IS NOT NULL`,
+              })
+          : tx.insert(issues).values(values);
+        const [issue] = await idempotentInsert.returning();
+        if (!issue && idempotencyKey) {
+          throw issueIdempotencyConflict(idempotencyKey);
+        }
+        if (!issue) {
+          throw new Error("Issue insert did not return a row");
+        }
         if (inputLabelIds) {
           await syncIssueLabels(issue.id, companyId, inputLabelIds, tx);
         }
@@ -4241,9 +4486,17 @@ export function issueService(db: Db) {
           );
         }
         const [enriched] = await withIssueLabels(tx, [issue]);
-        return enriched;
+        return { issue: enriched, reused: false } satisfies IssueCreateResult;
       });
+      } finally {
+        if (activeKey) activeIssueIdempotencyKeys.delete(`${companyId}:${activeKey}`);
+      }
     },
+
+    create: async (
+      companyId: string,
+      data: IssueCreateInput,
+    ) => (await issueService(db).createWithResult(companyId, data)).issue,
 
     update: async (
       id: string,

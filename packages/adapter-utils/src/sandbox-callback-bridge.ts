@@ -45,6 +45,7 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "GET", path: /^\/api\/companies\/[^/]+\/dashboard$/ },
   { method: "GET", path: /^\/api\/companies\/[^/]+\/agents$/ },
   { method: "GET", path: /^\/api\/companies\/[^/]+\/issues$/ },
+  { method: "GET", path: /^\/api\/companies\/[^/]+\/issues\/health$/ },
   { method: "GET", path: /^\/api\/companies\/[^/]+\/projects$/ },
   { method: "GET", path: /^\/api\/companies\/[^/]+\/goals$/ },
   { method: "GET", path: /^\/api\/companies\/[^/]+\/org$/ },

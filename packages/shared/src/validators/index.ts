@@ -174,6 +174,7 @@ export {
   addIssueCommentSchema,
   issueThreadInteractionStatusSchema,
   issueThreadInteractionKindSchema,
+  issueThreadInteractionResolverPolicySchema,
   issueThreadInteractionContinuationPolicySchema,
   suggestedTaskDraftSchema,
   suggestTasksPayloadSchema,

@@ -48,7 +48,7 @@ import {
   syncInstructionsBundleConfigFromFilePath,
   workspaceOperationService,
 } from "../services/index.js";
-import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
+import { conflict, ERROR_CODES, forbidden, notFound, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -554,7 +554,7 @@ export function agentRoutes(
     if (!req.actor.agentId) throw forbidden("Agent authentication required");
     const actorAgent = await svc.getById(req.actor.agentId);
     if (!actorAgent || actorAgent.companyId !== companyId) {
-      throw forbidden("Agent key cannot access another company");
+      throw forbidden("Agent key cannot access another company", ERROR_CODES.agentCrossCompanyAccess);
     }
     const allowedByGrant = await access.hasPermission(companyId, "agent", actorAgent.id, "agents:create");
     if (!allowedByGrant && !canCreateAgents(actorAgent)) {
@@ -680,7 +680,7 @@ export function agentRoutes(
 
     const actorAgent = await svc.getById(req.actor.agentId);
     if (!actorAgent || actorAgent.companyId !== targetAgent.companyId) {
-      throw forbidden("Agent key cannot access another company");
+      throw forbidden("Agent key cannot access another company", ERROR_CODES.agentCrossCompanyAccess);
     }
 
     if (actorAgent.id === targetAgent.id) return;
@@ -705,7 +705,7 @@ export function agentRoutes(
 
     const actorAgent = await svc.getById(req.actor.agentId);
     if (!actorAgent || actorAgent.companyId !== targetAgent.companyId) {
-      throw forbidden("Agent key cannot access another company");
+      throw forbidden("Agent key cannot access another company", ERROR_CODES.agentCrossCompanyAccess);
     }
   }
 

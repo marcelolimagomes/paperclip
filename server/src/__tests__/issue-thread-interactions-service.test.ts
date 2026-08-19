@@ -57,6 +57,124 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     await tempDb?.cleanup();
   });
 
+  it("allows an addressed agent to resolve and the creator to cancel without weakening board-only gates", async () => {
+    const companyId = randomUUID();
+    const goalId = randomUUID();
+    const issueId = randomUUID();
+    const creatorAgentId = randomUUID();
+    const addresseeAgentId = randomUUID();
+    const sourceRunId = randomUUID();
+    const resolverRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(goals).values({
+      id: goalId,
+      companyId,
+      title: "Governed agent interaction",
+      level: "task",
+      status: "active",
+    });
+    await db.insert(agents).values([creatorAgentId, addresseeAgentId].map((id, index) => ({
+      id,
+      companyId,
+      name: index === 0 ? "Creator" : "Addressee",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    })));
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      goalId,
+      title: "Governed interaction",
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: addresseeAgentId,
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: sourceRunId,
+        companyId,
+        agentId: creatorAgentId,
+        invocationSource: "manual",
+        status: "running",
+        startedAt: new Date("2026-08-19T12:00:00.000Z"),
+      },
+      {
+        id: resolverRunId,
+        companyId,
+        agentId: addresseeAgentId,
+        invocationSource: "manual",
+        status: "running",
+        startedAt: new Date("2026-08-19T12:01:00.000Z"),
+      },
+    ]);
+
+    const interaction = await interactionsSvc.create({ id: issueId, companyId }, {
+      kind: "ask_user_questions",
+      resolverPolicy: "board_or_agents",
+      addresseeAgentId,
+      sourceRunId,
+      payload: {
+        version: 1,
+        questions: [{
+          id: "scope",
+          prompt: "Choose a scope",
+          selectionMode: "single",
+          required: true,
+          options: [{ id: "phase-1", label: "Phase 1" }],
+        }],
+      },
+    }, { agentId: creatorAgentId, runId: sourceRunId });
+
+    const answered = await interactionsSvc.answerQuestions({ id: issueId, companyId }, interaction.id, {
+      answers: [{ questionId: "scope", optionIds: ["phase-1"] }],
+    }, { agentId: addresseeAgentId, runId: resolverRunId });
+
+    expect(answered).toMatchObject({
+      status: "answered",
+      addresseeAgentId,
+      resolvedByAgentId: addresseeAgentId,
+      resolvedByRunId: resolverRunId,
+      resolverPolicy: "board_or_agents",
+    });
+
+    const boardOnly = await interactionsSvc.create({ id: issueId, companyId }, {
+      kind: "ask_user_questions",
+      idempotencyKey: "board-only-question",
+      sourceRunId,
+      payload: {
+        version: 1,
+        questions: [{
+          id: "scope",
+          prompt: "Choose a scope",
+          selectionMode: "single",
+          options: [{ id: "phase-1", label: "Phase 1" }],
+        }],
+      },
+    }, { agentId: creatorAgentId, runId: sourceRunId });
+
+    await expect(interactionsSvc.answerQuestions({ id: issueId, companyId }, boardOnly.id, {
+      answers: [{ questionId: "scope", optionIds: ["phase-1"] }],
+    }, { agentId: addresseeAgentId, runId: resolverRunId })).rejects.toMatchObject({
+      status: 403,
+      message: expect.stringContaining("board-only"),
+    });
+
+    const cancelled = await interactionsSvc.cancelQuestions({ id: issueId, companyId }, boardOnly.id, {
+      reason: "Withdrawn by creator",
+    }, { agentId: creatorAgentId, runId: sourceRunId });
+    expect(cancelled).toMatchObject({ status: "cancelled", resolvedByAgentId: creatorAgentId });
+  });
+
   it("accepts suggested tasks by creating a rooted issue tree under the current issue", async () => {
     const companyId = randomUUID();
     const goalId = randomUUID();

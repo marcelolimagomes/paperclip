@@ -77,7 +77,15 @@ import {
   workProductService,
 } from "../services/index.js";
 import { logger } from "../middleware/logger.js";
-import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
+import {
+  conflict,
+  ERROR_CODES,
+  forbidden,
+  HttpError,
+  notFound,
+  unauthorized,
+  unprocessable,
+} from "../errors.js";
 import { assertBoard, assertCompanyAccess, getActorInfo } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -1332,6 +1340,66 @@ export function issueRoutes(
     return true;
   }
 
+  async function assertIssueThreadInteractionResolutionAllowed(
+    req: Request,
+    res: Response,
+    issue: { id: string; companyId: string; status: string; assigneeAgentId: string | null },
+    interaction: {
+      createdByAgentId?: string | null;
+      sourceRunId?: string | null;
+      effectiveResolverPolicy?: string | null;
+      addresseeAgentId?: string | null;
+    },
+  ) {
+    if (req.actor.type !== "agent") {
+      assertBoard(req);
+      return true;
+    }
+
+    const actorAgentId = req.actor.agentId;
+    const runId = requireAgentRunId(req, res);
+    if (!actorAgentId || !runId) return false;
+    if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return false;
+    if ((interaction.effectiveResolverPolicy ?? "board_only") !== "board_or_agents") {
+      res.status(403).json({ error: "This issue-thread interaction is board-only" });
+      return false;
+    }
+    if (interaction.addresseeAgentId && interaction.addresseeAgentId !== actorAgentId) {
+      res.status(403).json({ error: "Only the addressed agent or a board user may resolve this issue-thread interaction" });
+      return false;
+    }
+    if (interaction.createdByAgentId === actorAgentId) {
+      res.status(403).json({ error: "Agents cannot resolve interactions they created" });
+      return false;
+    }
+    if (interaction.sourceRunId && interaction.sourceRunId === runId) {
+      res.status(403).json({ error: "Agents cannot resolve interactions created by the same run" });
+      return false;
+    }
+    return true;
+  }
+
+  async function assertIssueThreadInteractionCancellationAllowed(
+    req: Request,
+    res: Response,
+    interaction: { createdByAgentId?: string | null },
+  ) {
+    if (req.actor.type !== "agent") {
+      assertBoard(req);
+      return true;
+    }
+
+    const runId = requireAgentRunId(req, res);
+    if (!runId) return false;
+    if (interaction.createdByAgentId !== req.actor.agentId) {
+      res.status(403).json({ error: "Only the agent that created this interaction or a board user may cancel it" });
+      return false;
+    }
+    // Cancelling one's own interaction is intentionally independent of issue
+    // checkout ownership: it only withdraws the creator's pending request.
+    return true;
+  }
+
   function isStatusOnlyCheapRecoveryContext(contextSnapshot: unknown) {
     if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return false;
     const context = contextSnapshot as Record<string, unknown>;
@@ -1847,6 +1915,12 @@ export function issueRoutes(
       successfulRunHandoff: handoffStates.get(issue.id) ?? null,
       activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
     })));
+  });
+
+  router.get("/companies/:companyId/issues/health", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    res.json(await svc.listBoardHealth(companyId));
   });
 
   router.get("/companies/:companyId/issues/count", async (req, res) => {
@@ -3097,42 +3171,57 @@ export function issueRoutes(
       actor.actorType,
     );
     assertCanManageIssueMonitor(req, req.body.assigneeAgentId ?? null, Boolean(executionPolicy?.monitor));
-    const issue = await svc.create(companyId, {
-      ...req.body,
-      executionPolicy,
-      createdByAgentId: actor.agentId,
-      createdByUserId: actor.actorType === "user" ? actor.actorId : null,
-    });
-    await issueReferencesSvc.syncIssue(issue.id);
+    const createResult = typeof svc.createWithResult === "function"
+      ? await svc.createWithResult(companyId, {
+          ...req.body,
+          executionPolicy,
+          createdByAgentId: actor.agentId,
+          createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+        })
+      : {
+          issue: await svc.create(companyId, {
+            ...req.body,
+            executionPolicy,
+            createdByAgentId: actor.agentId,
+            createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+          }),
+          reused: false,
+        };
+    const { issue, reused: idempotentReplay } = createResult;
+    if (!idempotentReplay) {
+      await issueReferencesSvc.syncIssue(issue.id);
+    }
     const referenceSummary = await issueReferencesSvc.listIssueReferenceSummary(issue.id);
     const referenceDiff = issueReferencesSvc.diffIssueReferenceSummary(
       issueReferencesSvc.emptySummary(),
       referenceSummary,
     );
 
-    await logActivity(db, {
-      companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      action: "issue.created",
-      entityType: "issue",
-      entityId: issue.id,
-      details: {
-        title: issue.title,
-        identifier: issue.identifier,
-        ...buildCreateIssueActivityStatusDetails(issue, res),
-        ...(Array.isArray(req.body.blockedByIssueIds) ? { blockedByIssueIds: req.body.blockedByIssueIds } : {}),
-        ...summarizeIssueReferenceActivityDetails({
-          addedReferencedIssues: referenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
-          removedReferencedIssues: referenceDiff.removedReferencedIssues.map(summarizeIssueRelationForActivity),
-          currentReferencedIssues: referenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
-        }),
-      },
-    });
+    if (!idempotentReplay) {
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.created",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          title: issue.title,
+          identifier: issue.identifier,
+          ...buildCreateIssueActivityStatusDetails(issue, res),
+          ...(Array.isArray(req.body.blockedByIssueIds) ? { blockedByIssueIds: req.body.blockedByIssueIds } : {}),
+          ...summarizeIssueReferenceActivityDetails({
+            addedReferencedIssues: referenceDiff.addedReferencedIssues.map(summarizeIssueRelationForActivity),
+            removedReferencedIssues: referenceDiff.removedReferencedIssues.map(summarizeIssueRelationForActivity),
+            currentReferencedIssues: referenceDiff.currentReferencedIssues.map(summarizeIssueRelationForActivity),
+          }),
+        },
+      });
+    }
 
-    if (executionPolicy?.monitor) {
+    if (!idempotentReplay && executionPolicy?.monitor) {
       await logActivity(db, {
         companyId,
         actorType: actor.actorType,
@@ -3155,17 +3244,19 @@ export function issueRoutes(
       });
     }
 
-    void queueIssueAssignmentWakeup({
-      heartbeat,
-      issue,
-      reason: "issue_assigned",
-      mutation: "create",
-      contextSource: "issue.create",
-      requestedByActorType: actor.actorType,
-      requestedByActorId: actor.actorId,
-    });
+    if (!idempotentReplay) {
+      void queueIssueAssignmentWakeup({
+        heartbeat,
+        issue,
+        reason: "issue_assigned",
+        mutation: "create",
+        contextSource: "issue.create",
+        requestedByActorType: actor.actorType,
+        requestedByActorId: actor.actorId,
+      });
+    }
 
-    res.status(201).json({
+    res.status(idempotentReplay ? 200 : 201).json({
       ...issue,
       relatedWork: referenceSummary,
       referencedIssueIdentifiers: referenceSummary.outbound.map((item) => item.issue.identifier ?? item.issue.id),
@@ -4384,7 +4475,10 @@ export function issueRoutes(
 
   router.post("/issues/:id/admin/force-release", async (req, res) => {
     if (req.actor.type !== "board") {
-      res.status(403).json({ error: "Board access required" });
+      res.status(403).json({
+        error: "Board access required",
+        code: ERROR_CODES.boardAccessRequired,
+      });
       return;
     }
     if (!req.actor.userId) {
@@ -4532,11 +4626,16 @@ export function issueRoutes(
         return;
       }
       assertCompanyAccess(req, issue.companyId);
-      assertBoard(req);
+      const interactionSvc = issueThreadInteractionService(db);
+      const currentInteraction = req.actor.type === "agent"
+        ? await interactionSvc.getForIssue(issue, interactionId)
+        : null;
+      if (!(await assertIssueThreadInteractionResolutionAllowed(req, res, issue, currentInteraction ?? {}))) return;
 
       const actor = getActorInfo(req);
-      const { interaction, createdIssues, continuationIssue } = await issueThreadInteractionService(db).acceptInteraction(issue, interactionId, req.body, {
+      const { interaction, createdIssues, continuationIssue } = await interactionSvc.acceptInteraction(issue, interactionId, req.body, {
         agentId: actor.agentId,
+        runId: actor.runId,
         userId: actor.actorType === "user" ? actor.actorId : null,
       });
       const continuationWakeIssue = continuationIssue ?? issue;
@@ -4635,11 +4734,16 @@ export function issueRoutes(
         return;
       }
       assertCompanyAccess(req, issue.companyId);
-      assertBoard(req);
+      const interactionSvc = issueThreadInteractionService(db);
+      const currentInteraction = req.actor.type === "agent"
+        ? await interactionSvc.getForIssue(issue, interactionId)
+        : null;
+      if (!(await assertIssueThreadInteractionResolutionAllowed(req, res, issue, currentInteraction ?? {}))) return;
 
       const actor = getActorInfo(req);
-      const interaction = await issueThreadInteractionService(db).rejectInteraction(issue, interactionId, req.body, {
+      const interaction = await interactionSvc.rejectInteraction(issue, interactionId, req.body, {
         agentId: actor.agentId,
+        runId: actor.runId,
         userId: actor.actorType === "user" ? actor.actorId : null,
       });
 
@@ -4691,11 +4795,16 @@ export function issueRoutes(
         return;
       }
       assertCompanyAccess(req, issue.companyId);
-      assertBoard(req);
+      const interactionSvc = issueThreadInteractionService(db);
+      const currentInteraction = req.actor.type === "agent"
+        ? await interactionSvc.getForIssue(issue, interactionId)
+        : null;
+      if (!(await assertIssueThreadInteractionResolutionAllowed(req, res, issue, currentInteraction ?? {}))) return;
 
       const actor = getActorInfo(req);
-      const interaction = await issueThreadInteractionService(db).answerQuestions(issue, interactionId, req.body, {
+      const interaction = await interactionSvc.answerQuestions(issue, interactionId, req.body, {
         agentId: actor.agentId,
+        runId: actor.runId,
         userId: actor.actorType === "user" ? actor.actorId : null,
       });
 
@@ -4743,11 +4852,16 @@ export function issueRoutes(
         return;
       }
       assertCompanyAccess(req, issue.companyId);
-      assertBoard(req);
+      const interactionSvc = issueThreadInteractionService(db);
+      const currentInteraction = req.actor.type === "agent"
+        ? await interactionSvc.getForIssue(issue, interactionId)
+        : null;
+      if (!(await assertIssueThreadInteractionCancellationAllowed(req, res, currentInteraction ?? {}))) return;
 
       const actor = getActorInfo(req);
-      const interaction = await issueThreadInteractionService(db).cancelQuestions(issue, interactionId, req.body, {
+      const interaction = await interactionSvc.cancelQuestions(issue, interactionId, req.body, {
         agentId: actor.agentId,
+        runId: actor.runId,
         userId: actor.actorType === "user" ? actor.actorId : null,
       });
 

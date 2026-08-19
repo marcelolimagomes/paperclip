@@ -1,4 +1,4 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -26,8 +26,19 @@ export function tokenHashesMatch(left: string, right: string) {
   return leftBytes.length === rightBytes.length && timingSafeEqual(leftBytes, rightBytes);
 }
 
-export function createBoardApiToken() {
-  return `pcp_board_${randomBytes(24).toString("hex")}`;
+function boardApiTokenDerivationSecret() {
+  const secret = process.env.BETTER_AUTH_SECRET?.trim() || process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim();
+  if (!secret) {
+    throw new Error("BETTER_AUTH_SECRET or PAPERCLIP_AGENT_JWT_SECRET must be configured for CLI auth");
+  }
+  return secret;
+}
+
+export function createBoardApiTokenForCliChallenge(challengeSecret: string) {
+  const proof = createHmac("sha256", boardApiTokenDerivationSecret())
+    .update(`cli-auth-board-key:${challengeSecret}`)
+    .digest("hex");
+  return `pcp_board_${proof}`;
 }
 
 export function createCliAuthSecret() {
@@ -167,7 +178,7 @@ export function boardAuthService(db: Db) {
     requestedCompanyId?: string | null;
   }) {
     const challengeSecret = createCliAuthSecret();
-    const pendingBoardToken = createBoardApiToken();
+    const pendingBoardToken = createBoardApiTokenForCliChallenge(challengeSecret);
     const expiresAt = cliAuthChallengeExpiresAt();
     const labelBase = input.clientName?.trim() || "paperclipai cli";
     const pendingKeyName =
@@ -193,7 +204,6 @@ export function boardAuthService(db: Db) {
     return {
       challenge: created,
       challengeSecret,
-      pendingBoardToken,
     };
   }
 
@@ -216,6 +226,8 @@ export function boardAuthService(db: Db) {
     const challenge = await getCliAuthChallengeBySecret(id, token);
     if (!challenge) return null;
 
+    const status = challengeStatusForRow(challenge);
+
     const [company, approvedBy] = await Promise.all([
       challenge.requestedCompanyId
         ? db
@@ -235,7 +247,7 @@ export function boardAuthService(db: Db) {
 
     return {
       id: challenge.id,
-      status: challengeStatusForRow(challenge),
+      status,
       command: challenge.command,
       clientName: challenge.clientName ?? null,
       requestedAccess: challenge.requestedAccess as "board" | "instance_admin_required",
@@ -251,6 +263,9 @@ export function boardAuthService(db: Db) {
             email: approvedBy.email,
           }
         : null,
+      ...(status === "approved"
+        ? { boardApiToken: createBoardApiTokenForCliChallenge(token) }
+        : {}),
     };
   }
 

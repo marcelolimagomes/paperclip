@@ -1,4 +1,5 @@
 import type { Request, RequestHandler } from "express";
+import { ERROR_CODES } from "../errors.js";
 
 function isLoopbackHostname(hostname: string): boolean {
   const normalized = hostname.trim().toLowerCase();
@@ -70,7 +71,7 @@ export function privateHostnameGuard(opts: {
     if (!hostname) {
       const error = "Missing Host header. If you want to allow a hostname, run pnpm paperclipai allowed-hostname <host>.";
       if (wantsJson) {
-        res.status(403).json({ error });
+        res.status(403).json({ error, code: ERROR_CODES.hostnameNotAllowed });
       } else {
         res.status(403).type("text/plain").send(error);
       }
@@ -84,7 +85,7 @@ export function privateHostnameGuard(opts: {
 
     const error = blockedHostnameMessage(hostname);
     if (wantsJson) {
-      res.status(403).json({ error });
+      res.status(403).json({ error, code: ERROR_CODES.hostnameNotAllowed });
     } else {
       res.status(403).type("text/plain").send(error);
     }

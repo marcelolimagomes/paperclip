@@ -31,6 +31,15 @@ describe("issue validators", () => {
       .toBeUndefined();
   });
 
+  it("accepts and trims the optional issue idempotency key", () => {
+    expect(createIssueSchema.parse({
+      title: "Retryable issue",
+      idempotencyKey: "  client-request-1  ",
+    }).idempotencyKey).toBe("client-request-1");
+    expect(createIssueSchema.safeParse({ title: "Retryable issue", idempotencyKey: " " }).success)
+      .toBe(false);
+  });
+
   it("normalizes JSON-escaped line breaks in issue descriptions", () => {
     const parsed = createIssueSchema.parse({
       title: "Follow up PR",

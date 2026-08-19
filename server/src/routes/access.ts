@@ -47,6 +47,7 @@ import {
 } from "@paperclipai/shared";
 import type { DeploymentExposure, DeploymentMode, HumanCompanyMembershipRole, PermissionKey } from "@paperclipai/shared";
 import {
+  ERROR_CODES,
   forbidden,
   conflict,
   notFound,
@@ -64,6 +65,7 @@ import {
   logActivity,
   notifyHireApproved
 } from "../services/index.js";
+import { createCliAuthRateLimiter, type CliAuthRateLimiter } from "../services/cli-auth-rate-limit.js";
 import {
   grantsForHumanRole,
   normalizeHumanRole,
@@ -130,6 +132,23 @@ function requestBaseUrl(req: Request) {
     req.header("x-forwarded-host")?.split(",")[0]?.trim() || req.header("host");
   if (!host) return "";
   return `${proto}://${host}`;
+}
+
+function configuredPublicBaseUrl(configuredPublicUrl?: string | null) {
+  const raw = process.env.PAPERCLIP_PUBLIC_URL !== undefined
+    ? process.env.PAPERCLIP_PUBLIC_URL.trim()
+    : configuredPublicUrl?.trim() ?? "";
+  if (!raw) return null;
+
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    if (parsed.username || parsed.password || parsed.search || parsed.hash) return null;
+    const pathname = parsed.pathname.replace(/\/+$/, "");
+    return `${parsed.origin}${pathname}`;
+  } catch {
+    return null;
+  }
 }
 
 function buildCliAuthApprovalPath(challengeId: string, token: string) {
@@ -2433,7 +2452,9 @@ export function accessRoutes(
     deploymentExposure: DeploymentExposure;
     bindHost: string;
     allowedHostnames: string[];
+    publicUrl?: string | null;
     inviteResolutionNetwork?: Partial<InviteResolutionNetwork>;
+    cliAuthRateLimiter?: CliAuthRateLimiter;
   }
 ) {
   const router = Router();
@@ -2443,6 +2464,7 @@ export function accessRoutes(
   const routeInviteResolutionNetwork = opts.inviteResolutionNetwork
     ? { ...defaultInviteResolutionNetwork, ...opts.inviteResolutionNetwork }
     : inviteResolutionNetwork;
+  const cliAuthRateLimiter = opts.cliAuthRateLimiter ?? createCliAuthRateLimiter();
 
   async function assertInstanceAdmin(req: Request) {
     if (req.actor.type !== "board") throw unauthorized();
@@ -2503,16 +2525,29 @@ export function accessRoutes(
     "/cli-auth/challenges",
     validate(createCliAuthChallengeSchema),
     async (req, res) => {
+      // Use Express's resolved peer address. Do not trust a caller-supplied
+      // X-Forwarded-For value for an unauthenticated security boundary.
+      const rateLimit = cliAuthRateLimiter.consume(req.ip || "unknown");
+      res.setHeader("X-RateLimit-Limit", String(rateLimit.limit));
+      res.setHeader("X-RateLimit-Remaining", String(rateLimit.remaining));
+      if (!rateLimit.allowed) {
+        res.setHeader("Retry-After", String(rateLimit.retryAfterSeconds));
+        res.status(429).json({
+          error: "CLI auth challenge rate limit exceeded",
+          retryAfterSeconds: rateLimit.retryAfterSeconds,
+        });
+        return;
+      }
+
       const created = await boardAuth.createCliAuthChallenge(req.body);
       const approvalPath = buildCliAuthApprovalPath(
         created.challenge.id,
         created.challengeSecret,
       );
-      const baseUrl = requestBaseUrl(req);
+      const baseUrl = configuredPublicBaseUrl(opts.publicUrl);
       res.status(201).json({
         id: created.challenge.id,
         token: created.challengeSecret,
-        boardApiToken: created.pendingBoardToken,
         approvalPath,
         approvalUrl: baseUrl ? `${baseUrl}${approvalPath}` : null,
         pollPath: `/cli-auth/challenges/${created.challenge.id}`,
@@ -2696,7 +2731,7 @@ export function accessRoutes(
       if (!req.actor.agentId) throw forbidden("Agent authentication required");
       const actorAgent = await agents.getById(req.actor.agentId);
       if (!actorAgent || actorAgent.companyId !== companyId) {
-        throw forbidden("Agent key cannot access another company");
+        throw forbidden("Agent key cannot access another company", ERROR_CODES.agentCrossCompanyAccess);
       }
       if (actorAgent.role !== "ceo") {
         throw forbidden("Only CEO agents can generate OpenClaw invite prompts");

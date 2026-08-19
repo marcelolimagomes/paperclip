@@ -5,14 +5,14 @@ import {
   patchInstanceExperimentalSettingsSchema,
   patchInstanceGeneralSettingsSchema,
 } from "@paperclipai/shared";
-import { forbidden } from "../errors.js";
+import { ERROR_CODES, forbidden } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import { heartbeatService, instanceSettingsService, logActivity } from "../services/index.js";
 import { assertBoardOrgAccess, getActorInfo } from "./authz.js";
 
 function assertCanManageInstanceSettings(req: Request) {
   if (req.actor.type !== "board") {
-    throw forbidden("Board access required");
+    throw forbidden("Board access required", ERROR_CODES.boardAccessRequired);
   }
   if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) {
     return;

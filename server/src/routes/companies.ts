@@ -12,7 +12,7 @@ import {
   updateCompanyBrandingSchema,
   updateCompanySchema,
 } from "@paperclipai/shared";
-import { badRequest, forbidden } from "../errors.js";
+import { badRequest, ERROR_CODES, forbidden } from "../errors.js";
 import { validate } from "../middleware/validate.js";
 import {
   accessService,
@@ -66,7 +66,7 @@ export function companyRoutes(db: Db, storage?: StorageService) {
 
     const actorAgent = await agents.getById(req.actor.agentId);
     if (!actorAgent || actorAgent.companyId !== companyId) {
-      throw forbidden("Agent key cannot access another company");
+      throw forbidden("Agent key cannot access another company", ERROR_CODES.agentCrossCompanyAccess);
     }
     if (actorAgent.role !== "ceo") {
       throw forbidden("Only CEO agents can update company branding");
@@ -80,7 +80,7 @@ export function companyRoutes(db: Db, storage?: StorageService) {
 
     const actorAgent = await agents.getById(req.actor.agentId);
     if (!actorAgent || actorAgent.companyId !== companyId) {
-      throw forbidden("Agent key cannot access another company");
+      throw forbidden("Agent key cannot access another company", ERROR_CODES.agentCrossCompanyAccess);
     }
     if (actorAgent.role !== "ceo") {
       throw forbidden(`Only CEO agents can manage company ${capability}`);
@@ -315,7 +315,7 @@ export function companyRoutes(db: Db, storage?: StorageService) {
         throw forbidden("Only CEO agents or board users may update company settings");
       }
       if (actorAgent.companyId !== companyId) {
-        throw forbidden("Agent key cannot access another company");
+        throw forbidden("Agent key cannot access another company", ERROR_CODES.agentCrossCompanyAccess);
       }
       body = updateCompanyBrandingSchema.parse(req.body);
     } else {

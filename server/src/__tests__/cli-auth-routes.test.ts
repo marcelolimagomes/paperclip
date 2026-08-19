@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createCliAuthRateLimiter } from "../services/cli-auth-rate-limit.js";
 
 const mockAccessService = vi.hoisted(() => ({
   isInstanceAdmin: vi.fn(),
@@ -49,7 +50,14 @@ function registerModuleMocks() {
 
 let appImportCounter = 0;
 
-async function createApp(actor: any, db: any = {} as any) {
+async function createApp(
+  actor: any,
+  db: any = {} as any,
+  routeOptions: {
+    cliAuthRateLimiter?: ReturnType<typeof createCliAuthRateLimiter>;
+    publicUrl?: string | null;
+  } = {},
+) {
   appImportCounter += 1;
   const routeModulePath = `../routes/access.js?cli-auth-routes-${appImportCounter}`;
   const middlewareModulePath = `../middleware/index.js?cli-auth-routes-${appImportCounter}`;
@@ -81,6 +89,8 @@ async function createApp(actor: any, db: any = {} as any) {
       deploymentExposure: "private",
       bindHost: "127.0.0.1",
       allowedHostnames: [],
+      publicUrl: "https://paperclip.example.test",
+      ...routeOptions,
     }),
   );
   app.use(errorHandler);
@@ -104,8 +114,7 @@ describe.sequential("cli auth routes", () => {
         id: "challenge-1",
         expiresAt: new Date("2026-03-23T13:00:00.000Z"),
       },
-      challengeSecret: "pcp_cli_auth_secret",
-      pendingBoardToken: "pcp_board_token",
+      challengeSecret: "test_cli_auth_challenge_secret",
     });
 
     const app = await createApp({ type: "none", source: "none" });
@@ -120,13 +129,80 @@ describe.sequential("cli auth routes", () => {
     expect(res.status, res.text || JSON.stringify(res.body)).toBe(201);
     expect(res.body).toMatchObject({
       id: "challenge-1",
-      token: "pcp_cli_auth_secret",
-      approvalPath: "/cli-auth/challenge-1?token=pcp_cli_auth_secret",
+      token: "test_cli_auth_challenge_secret",
+      approvalPath: "/cli-auth/challenge-1?token=test_cli_auth_challenge_secret",
       pollPath: "/cli-auth/challenges/challenge-1",
       expiresAt: "2026-03-23T13:00:00.000Z",
     });
-    expect(res.body.boardApiToken).toBe("pcp_board_token");
-    expect(res.body.approvalUrl).toContain("/cli-auth/challenge-1?token=pcp_cli_auth_secret");
+    expect(res.body).not.toHaveProperty("boardApiToken");
+    expect(res.body.approvalUrl).toContain("/cli-auth/challenge-1?token=test_cli_auth_challenge_secret");
+  });
+
+  it.sequential("builds approval URLs from the configured public URL", async () => {
+    mockBoardAuthService.createCliAuthChallenge.mockResolvedValue({
+      challenge: {
+        id: "challenge-1",
+        expiresAt: new Date("2026-03-23T13:00:00.000Z"),
+      },
+      challengeSecret: "test_cli_auth_challenge_secret",
+    });
+
+    const app = await createApp(
+      { type: "none", source: "none" },
+      {} as any,
+      { publicUrl: "https://trusted.paperclip.example.test" },
+    );
+    const res = await request(app)
+      .post("/api/cli-auth/challenges")
+      .set("Host", "attacker.example.test")
+      .set("X-Forwarded-Host", "attacker.example.test")
+      .send({
+        command: "paperclipai company import",
+        clientName: "paperclipai cli",
+        requestedAccess: "board",
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body.approvalUrl).toBe(
+      "https://trusted.paperclip.example.test/cli-auth/challenge-1?token=test_cli_auth_challenge_secret",
+    );
+  });
+
+  it.sequential("rate limits challenge creation by client IP", async () => {
+    mockBoardAuthService.createCliAuthChallenge.mockResolvedValue({
+      challenge: {
+        id: "challenge-1",
+        expiresAt: new Date("2026-03-23T13:00:00.000Z"),
+      },
+      challengeSecret: "test_cli_auth_challenge_secret",
+    });
+
+    const app = await createApp(
+      { type: "none", source: "none" },
+      {} as any,
+      {
+        cliAuthRateLimiter: createCliAuthRateLimiter({
+          maxRequests: 1,
+          windowMs: 60_000,
+          now: () => 1_000,
+        }),
+      },
+    );
+    const body = {
+      command: "paperclipai company import",
+      clientName: "paperclipai cli",
+      requestedAccess: "board",
+    };
+
+    await request(app).post("/api/cli-auth/challenges").send(body).expect(201);
+    const limited = await request(app).post("/api/cli-auth/challenges").send(body).expect(429);
+
+    expect(mockBoardAuthService.createCliAuthChallenge).toHaveBeenCalledTimes(1);
+    expect(limited.body).toMatchObject({
+      error: "CLI auth challenge rate limit exceeded",
+      retryAfterSeconds: 60,
+    });
+    expect(limited.headers["retry-after"]).toBe("60");
   });
 
   it.sequential("rejects anonymous access to generic skill documents", async () => {
@@ -187,11 +263,74 @@ describe.sequential("cli auth routes", () => {
     });
 
     const app = await createApp({ type: "none", source: "none" });
-    const res = await request(app).get("/api/cli-auth/challenges/challenge-1?token=pcp_cli_auth_secret");
+    const res = await request(app).get("/api/cli-auth/challenges/challenge-1?token=test_cli_auth_challenge_secret");
 
     expect(res.status).toBe(200);
     expect(res.body.requiresSignIn).toBe(true);
     expect(res.body.canApprove).toBe(false);
+    expect(res.body).not.toHaveProperty("boardApiToken");
+  });
+
+  it.sequential("does not produce a credential for an unapproved challenge", async () => {
+    mockBoardAuthService.createCliAuthChallenge.mockResolvedValue({
+      challenge: {
+        id: "challenge-1",
+        expiresAt: new Date("2026-03-23T13:00:00.000Z"),
+      },
+      challengeSecret: "test_cli_auth_challenge_secret",
+    });
+    mockBoardAuthService.describeCliAuthChallenge.mockResolvedValue({
+      id: "challenge-1",
+      status: "pending",
+      command: "paperclipai company import",
+      clientName: "paperclipai cli",
+      requestedAccess: "board",
+      requestedCompanyId: null,
+      requestedCompanyName: null,
+      approvedAt: null,
+      cancelledAt: null,
+      expiresAt: "2026-03-23T13:00:00.000Z",
+      approvedByUser: null,
+    });
+
+    const app = await createApp({ type: "none", source: "none" });
+    const created = await request(app)
+      .post("/api/cli-auth/challenges")
+      .send({
+        command: "paperclipai company import",
+        clientName: "paperclipai cli",
+        requestedAccess: "board",
+      })
+      .expect(201);
+    const polled = await request(app)
+      .get("/api/cli-auth/challenges/challenge-1?token=test_cli_auth_challenge_secret")
+      .expect(200);
+
+    expect(created.body).not.toHaveProperty("boardApiToken");
+    expect(polled.body).not.toHaveProperty("boardApiToken");
+  });
+
+  it.sequential("only returns the board API token after human approval", async () => {
+    mockBoardAuthService.describeCliAuthChallenge.mockResolvedValue({
+      id: "challenge-1",
+      status: "approved",
+      command: "paperclipai company import",
+      clientName: "paperclipai cli",
+      requestedAccess: "board",
+      requestedCompanyId: null,
+      requestedCompanyName: null,
+      approvedAt: "2026-03-23T12:05:00.000Z",
+      cancelledAt: null,
+      expiresAt: "2026-03-23T13:00:00.000Z",
+      approvedByUser: { id: "user-1", name: "User One", email: "user@example.com" },
+      boardApiToken: "test_board_api_token_after_approval",
+    });
+
+    const app = await createApp({ type: "none", source: "none" });
+    const res = await request(app).get("/api/cli-auth/challenges/challenge-1?token=test_cli_auth_challenge_secret");
+
+    expect(res.status).toBe(200);
+    expect(res.body.boardApiToken).toBe("test_board_api_token_after_approval");
   });
 
   it.sequential("approves a CLI auth challenge for a signed-in board user", async () => {
@@ -221,12 +360,12 @@ describe.sequential("cli auth routes", () => {
     });
     const res = await request(app)
       .post("/api/cli-auth/challenges/challenge-1/approve")
-      .send({ token: "pcp_cli_auth_secret" });
+      .send({ token: "test_cli_auth_challenge_secret" });
 
     expect(res.status).toBe(200);
     expect(mockBoardAuthService.approveCliAuthChallenge).toHaveBeenCalledWith(
       "challenge-1",
-      "pcp_cli_auth_secret",
+      "test_cli_auth_challenge_secret",
       "user-1",
     );
     expect(mockLogActivity).toHaveBeenCalledTimes(1);
@@ -261,7 +400,7 @@ describe.sequential("cli auth routes", () => {
     });
     const res = await request(app)
       .post("/api/cli-auth/challenges/challenge-2/approve")
-      .send({ token: "pcp_cli_auth_secret" });
+      .send({ token: "test_cli_auth_challenge_secret" });
 
     expect(res.status).toBe(200);
     expect(mockBoardAuthService.resolveBoardActivityCompanyIds).toHaveBeenCalledWith({

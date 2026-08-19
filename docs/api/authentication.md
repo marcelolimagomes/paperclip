@@ -54,3 +54,13 @@ All entities belong to a company. The API enforces company boundaries:
 - Agents can only access entities in their own company
 - Board operators can access all companies they're members of
 - Cross-company access is denied with `403`
+
+## CLI Pairing
+
+The CLI device-pairing flow is approval-gated:
+
+1. `POST /api/cli-auth/challenges` creates a short-lived challenge and returns only the challenge polling secret and the approval URL derived from the configured public URL.
+2. The signed-in human approves the challenge in the browser.
+3. `GET /api/cli-auth/challenges/{id}?token=...` returns `boardApiToken` only while the challenge status is `approved`.
+
+The challenge-creation endpoint is limited to five requests per minute per resolved client IP. A rejected request returns `429`, `Retry-After`, and `retryAfterSeconds`. Clients must not expect `boardApiToken` in the creation response.

@@ -14,6 +14,7 @@ const mockIssueService = vi.hoisted(() => ({
   getComment: vi.fn(),
   getCommentCursor: vi.fn(),
   getRelationSummaries: vi.fn(),
+  listBoardHealth: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
   findMentionedAgents: vi.fn(async () => []),
@@ -151,6 +152,7 @@ function expectClearAssignedStatusValidation(res: request.Response) {
 describe("assigned backlog creation contract", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    delete (mockIssueService as any).createWithResult;
     mockIssueService.getById.mockResolvedValue(makeIssue({
       id: "parent-1",
       title: "Parent issue",
@@ -175,8 +177,56 @@ describe("assigned backlog creation contract", () => {
       parentBlockerAdded: Boolean(data.blockParentUntilDone),
     }));
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
+    mockIssueService.listBoardHealth.mockResolvedValue({
+      issues: [
+        {
+          id: "issue-1",
+          identifier: "PAP-3700",
+          title: "Board health issue",
+          status: "blocked",
+          priority: "medium",
+          assignee: {
+            type: "agent",
+            agentId: assigneeAgentId,
+            userId: null,
+            name: "Broken agent",
+            role: "engineer",
+            title: null,
+            status: "error",
+          },
+          blockedBy: [],
+          unresolvedBlockerCount: 0,
+          pendingInteractionCount: 0,
+        },
+      ],
+      summary: {
+        openIssueCount: 1,
+        blockedIssueCount: 1,
+        blockedWithoutBlockerCount: 1,
+        assignedToErrorAgentCount: 1,
+        issuesWithPendingInteractionCount: 0,
+      },
+    });
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
+  });
+
+  it("exposes board health through the company-scoped read route", async () => {
+    const app = await createApp();
+
+    const response = await request(app)
+      .get("/api/companies/company-1/issues/health")
+      .expect(200);
+
+    expect(response.body.summary).toEqual({
+      openIssueCount: 1,
+      blockedIssueCount: 1,
+      blockedWithoutBlockerCount: 1,
+      assignedToErrorAgentCount: 1,
+      issuesWithPendingInteractionCount: 0,
+    });
+    expect(response.body.issues[0].assignee.status).toBe("error");
+    expect(mockIssueService.listBoardHealth).toHaveBeenCalledWith("company-1");
   });
 
   it("does not silently create a top-level assigned issue as backlog when status is omitted", async () => {
@@ -318,5 +368,35 @@ describe("assigned backlog creation contract", () => {
       }),
     );
     expect(mockWakeup).not.toHaveBeenCalled();
+  });
+
+  it("returns an idempotent replay without repeating creation side effects", async () => {
+    const issue = makeIssue({ id: "issue-1", title: "Retryable issue", assigneeAgentId });
+    const createWithResult = vi
+      .fn()
+      .mockResolvedValueOnce({ issue, reused: false })
+      .mockResolvedValueOnce({ issue, reused: true });
+    (mockIssueService as any).createWithResult = createWithResult;
+    const body = {
+      title: issue.title,
+      assigneeAgentId,
+      idempotencyKey: "client-request-1",
+    };
+
+    const app = await createApp();
+    const first = await request(app)
+      .post("/api/companies/company-1/issues")
+      .send(body)
+      .expect(201);
+    const second = await request(app)
+      .post("/api/companies/company-1/issues")
+      .send(body)
+      .expect(200);
+
+    expect(first.body.id).toBe(issue.id);
+    expect(second.body.id).toBe(issue.id);
+    expect(createWithResult).toHaveBeenCalledTimes(2);
+    expect(mockLogActivity.mock.calls.filter(([, entry]) => entry.action === "issue.created")).toHaveLength(1);
+    expect(mockWakeup).toHaveBeenCalledTimes(1);
   });
 });

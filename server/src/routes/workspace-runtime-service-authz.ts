@@ -2,7 +2,7 @@ import { and, eq, inArray, isNull, ne, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, issues } from "@paperclipai/db";
 import type { Request } from "express";
-import { forbidden } from "../errors.js";
+import { ERROR_CODES, forbidden } from "../errors.js";
 import { assertCompanyAccess } from "./authz.js";
 
 const WORKSPACE_RUNTIME_ELIGIBLE_ISSUE_STATUSES: string[] = [
@@ -71,7 +71,7 @@ async function assertAgentCanManageRuntimeServicesForWorkspace(
     .then((rows) => rows[0] ?? null);
 
   if (!actorAgent || actorAgent.companyId !== input.companyId) {
-    throw forbidden("Agent key cannot access another company");
+    throw forbidden("Agent key cannot access another company", ERROR_CODES.agentCrossCompanyAccess);
   }
 
   if (actorAgent.role === "ceo") {

@@ -23,7 +23,6 @@ interface BoardAuthStore {
 interface CreateChallengeResponse {
   id: string;
   token: string;
-  boardApiToken: string;
   approvalPath: string;
   approvalUrl: string | null;
   pollPath: string;
@@ -43,6 +42,7 @@ interface ChallengeStatusResponse {
   cancelledAt: string | null;
   expiresAt: string;
   approvedByUser: { id: string; name: string; email: string } | null;
+  boardApiToken?: string;
 }
 
 function defaultBoardAuthStore(): BoardAuthStore {
@@ -233,22 +233,25 @@ export async function loginBoardCli(params: {
     );
 
     if (status.status === "approved") {
+      if (!status.boardApiToken) {
+        throw new Error("CLI auth challenge was approved without a board API token.");
+      }
       const me = await requestJson<{ userId: string; user?: { id: string } | null }>(
         `${apiBase}/api/cli-auth/me`,
         {
           headers: {
-            authorization: `Bearer ${challenge.boardApiToken}`,
+            authorization: `Bearer ${status.boardApiToken}`,
           },
         },
       );
       setStoredBoardCredential({
         apiBase,
-        token: challenge.boardApiToken,
+        token: status.boardApiToken,
         userId: me.userId ?? me.user?.id ?? null,
         storePath: params.storePath,
       });
       return {
-        token: challenge.boardApiToken,
+        token: status.boardApiToken,
         approvalUrl,
         userId: me.userId ?? me.user?.id ?? null,
       };

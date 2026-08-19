@@ -9,6 +9,32 @@ const BARE_ISSUE_IDENTIFIER_RE = /^[A-Z][A-Z0-9]*-\d+$/i;
 const ISSUE_SCHEME_RE = /^issue:\/\/:?([^?#\s]+)(?:[?#].*)?$/i;
 const ISSUE_REFERENCE_TOKEN_RE = /issue:\/\/:?[^\s<>()]+|https?:\/\/[^\s<>()]+|\/(?:[^\s<>()/]+\/)*issues\/[A-Z][A-Z0-9]*-\d+(?=$|[\s<>)\],.;!?:])|\b[A-Z][A-Z0-9]*-\d+\b/gi;
 
+// Prefixo do token solto (`ADR-019` -> `ADR`). So a forma SOLTA e' filtrada
+// pelos prefixos conhecidos; `issue://`, caminho `/…/issues/X-1` e URL completa
+// continuam valendo, porque ali a intencao do autor e' inequivoca.
+const BARE_TOKEN_PREFIX_RE = /^([A-Z][A-Z0-9]*)-\d+$/i;
+
+/**
+ * Um token `LETRAS-NUMERO` so e' referencia de issue se o prefixo pertencer a
+ * um projeto existente.
+ *
+ * Sem esse filtro, qualquer `ADR-019`, `RFC-8693` ou marcador de lista `L-01`
+ * num corpo de issue virava link, e cada link busca a issue para exibir titulo
+ * e status -- 404 por token, repetido a cada evento de WebSocket, porque o
+ * `invalidateQueries` refaz todas as queries. Havia 27 tokens assim nos corpos
+ * desta instancia; `ADR-002` sozinho aparecia 28 vezes.
+ *
+ * Conjunto vazio significa "ainda nao sei" (as empresas nao carregaram), e ai
+ * o token NAO vira link: um link que aparece tarde e' melhor que uma rajada de
+ * requisicoes para issues que nao existem.
+ */
+function isKnownIssuePrefix(core: string, knownPrefixes: ReadonlySet<string> | null): boolean {
+  const bare = core.match(BARE_TOKEN_PREFIX_RE);
+  if (!bare) return true;
+  if (!knownPrefixes || knownPrefixes.size === 0) return false;
+  return knownPrefixes.has((bare[1] ?? "").toUpperCase());
+}
+
 export function parseIssuePathIdFromPath(pathOrUrl: string | null | undefined): string | null {
   if (!pathOrUrl) return null;
   const pathname = pathOrUrl.trim();
@@ -83,7 +109,10 @@ function createIssueLinkNode(value: string, href: string, childType: "text" | "i
   };
 }
 
-function linkifyIssueReferencesInText(value: string): MarkdownNode[] | null {
+function linkifyIssueReferencesInText(
+  value: string,
+  knownPrefixes: ReadonlySet<string> | null,
+): MarkdownNode[] | null {
   const nodes: MarkdownNode[] = [];
   let cursor = 0;
   let matched = false;
@@ -95,6 +124,7 @@ function linkifyIssueReferencesInText(value: string): MarkdownNode[] | null {
     const start = match.index ?? 0;
     const end = start + raw.length;
     const { core, trailing } = splitTrailingPunctuation(raw);
+    if (!isKnownIssuePrefix(core, knownPrefixes)) continue;
     const issueRef = parseIssueReferenceFromHref(core);
     if (!issueRef) continue;
 
@@ -116,7 +146,7 @@ function linkifyIssueReferencesInText(value: string): MarkdownNode[] | null {
   return nodes;
 }
 
-function rewriteMarkdownTree(node: MarkdownNode) {
+function rewriteMarkdownTree(node: MarkdownNode, knownPrefixes: ReadonlySet<string> | null) {
   if (!Array.isArray(node.children) || node.children.length === 0) return;
   if (node.type === "link" || node.type === "linkReference" || node.type === "code" || node.type === "definition" || node.type === "html") {
     return;
@@ -133,21 +163,27 @@ function rewriteMarkdownTree(node: MarkdownNode) {
     }
 
     if (child.type === "text" && typeof child.value === "string") {
-      const linked = linkifyIssueReferencesInText(child.value);
+      const linked = linkifyIssueReferencesInText(child.value, knownPrefixes);
       if (linked) {
         nextChildren.push(...linked);
         continue;
       }
     }
 
-    rewriteMarkdownTree(child);
+    rewriteMarkdownTree(child, knownPrefixes);
     nextChildren.push(child);
   }
   node.children = nextChildren;
 }
 
-export function remarkLinkIssueReferences() {
+export function remarkLinkIssueReferences(options?: {
+  /** Prefixos de issue existentes (ex.: TAS, JIM). Ver isKnownIssuePrefix. */
+  knownPrefixes?: Iterable<string> | null;
+}) {
+  const knownPrefixes = options?.knownPrefixes
+    ? new Set([...options.knownPrefixes].map((p) => p.toUpperCase()))
+    : null;
   return (tree: MarkdownNode) => {
-    rewriteMarkdownTree(tree);
+    rewriteMarkdownTree(tree, knownPrefixes);
   };
 }

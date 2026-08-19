@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseIssuePathIdFromPath, parseIssueReferenceFromHref } from "./issue-reference";
+import { parseIssuePathIdFromPath, parseIssueReferenceFromHref, remarkLinkIssueReferences } from "./issue-reference";
 
 describe("issue-reference", () => {
   it("extracts issue ids from company-scoped issue paths", () => {
@@ -65,5 +65,52 @@ describe("issue-reference", () => {
   it("ignores literal route placeholder paths", () => {
     expect(parseIssueReferenceFromHref("/issues/:id")).toBeNull();
     expect(parseIssueReferenceFromHref("http://localhost:3100/api/issues/:id")).toBeNull();
+  });
+});
+
+describe("allowlist de prefixo no token solto", () => {
+  const render = (text: string, knownPrefixes: string[] | null) => {
+    const tree = { type: "root", children: [{ type: "paragraph", children: [{ type: "text", value: text }] }] };
+    remarkLinkIssueReferences({ knownPrefixes })(tree as never);
+    const collect = (node: { type: string; url?: string; children?: unknown[] }): string[] => [
+      ...(node.type === "link" && node.url ? [node.url] : []),
+      ...((node.children ?? []) as { type: string; url?: string; children?: unknown[] }[]).flatMap(collect),
+    ];
+    return collect(tree as never);
+  };
+
+  it("nao linka um token cujo prefixo nao e' de nenhum projeto", () => {
+    // ADR-019 e' referencia a uma decisao, nao a uma issue. Antes deste filtro
+    // virava link e disparava GET /api/issues/ADR-019 -> 404 a cada evento.
+    expect(render("ver ADR-019 e RFC-8693", ["TAS", "JIM"])).toEqual([]);
+  });
+
+  it("continua linkando um token de prefixo real", () => {
+    expect(render("ver TAS-97", ["TAS", "JIM"])).toEqual(["/issues/TAS-97"]);
+  });
+
+  it("ignora caixa do prefixo e normaliza o identificador", () => {
+    // O resolver ja normalizava para maiusculas; o allowlist tambem compara
+    // sem caixa, entao `tas-97` casa o prefixo TAS e vira /issues/TAS-97.
+    expect(render("ver tas-97", ["TAS"])).toEqual(["/issues/TAS-97"]);
+  });
+
+  it("nao linka marcador de lista", () => {
+    // L-01 e R-04 sao numeracao no corpo da especificacao.
+    expect(render("L-01 e R-04 pendentes", ["TAS", "JIM"])).toEqual([]);
+  });
+
+  it("sem prefixos conhecidos, nao linka token solto", () => {
+    // Conjunto vazio = empresas ainda nao carregaram. Linkar aqui reintroduz a
+    // rajada de 404; o link aparece quando os prefixos chegarem.
+    expect(render("ver TAS-97", null)).toEqual([]);
+    expect(render("ver TAS-97", [])).toEqual([]);
+  });
+
+  it("forma explicita continua valendo mesmo com prefixo desconhecido", () => {
+    // Caminho e esquema sao intencao inequivoca do autor; so a forma SOLTA
+    // depende do allowlist.
+    expect(render("/TAS/issues/ADR-019", ["TAS"])).toEqual(["/issues/ADR-019"]);
+    expect(render("issue://ADR-019", ["TAS"])).toEqual(["/issues/ADR-019"]);
   });
 });

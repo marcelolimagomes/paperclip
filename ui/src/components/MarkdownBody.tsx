@@ -1,4 +1,4 @@
-import { isValidElement, useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { isValidElement, useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Check, Copy, ExternalLink, Github } from "lucide-react";
 import Markdown, { defaultUrlTransform, type Components, type Options } from "react-markdown";
@@ -6,6 +6,7 @@ import remarkGfm from "remark-gfm";
 import { cn } from "../lib/utils";
 import { Link } from "@/lib/router";
 import { useTheme } from "../context/ThemeContext";
+import { companiesApi } from "../api/companies";
 import { mentionChipInlineStyle, parseMentionChipHref } from "../lib/mention-chips";
 import { issuesApi } from "../api/issues";
 import { queryKeys } from "../lib/queryKeys";
@@ -500,12 +501,32 @@ export function MarkdownBody({
   onImageClick,
 }: MarkdownBodyProps) {
   const { theme } = useTheme();
+  // Prefixos reais dos projetos, para o linkificador nao tratar `ADR-019` ou
+  // um marcador de lista `L-01` como issue. Lido pela query -- e nao pelo
+  // useCompany() -- de proposito: aquele hook lanca fora do CompanyProvider, e
+  // o MarkdownBody e' renderizado em catorze lugares. O React Query deduplica,
+  // entao nao ha requisicao extra alem da que o CompanyContext ja faz.
+  const { data: companiesForPrefixes } = useQuery({
+    queryKey: queryKeys.companies.all,
+    queryFn: () => companiesApi.list(),
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+  });
+  const knownPrefixes = useMemo(() => {
+    const source = Array.isArray(companiesForPrefixes)
+      ? companiesForPrefixes
+      : (companiesForPrefixes as { companies?: { issuePrefix?: string }[] } | undefined)?.companies;
+    return (source ?? [])
+      .map((company) => company?.issuePrefix)
+      .filter((prefix): prefix is string => typeof prefix === "string" && prefix.length > 0);
+  }, [companiesForPrefixes]);
+
   const remarkPlugins: NonNullable<Options["remarkPlugins"]> = [remarkGfm];
   if (enableWikiLinks) {
     remarkPlugins.push(createRemarkWikiLinks({ wikiLinkRoot, resolveWikiLinkHref }));
   }
   if (linkIssueReferences) {
-    remarkPlugins.push(remarkLinkIssueReferences);
+    remarkPlugins.push(remarkLinkIssueReferences({ knownPrefixes }));
   }
   if (softBreaks) {
     remarkPlugins.push(remarkSoftBreaks);
